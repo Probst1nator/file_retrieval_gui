@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cli-agent-shared"
+version = "1.0.0"
+description = "Shared infrastructure for CLI-Agent tools"
+authors = [
+    {name = "Probst1nator", email = "your-email@example.com"}
+]
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+dependencies = [
+    "termcolor>=2.0.0",
+    "python-dotenv>=1.0.0",
+]
+
+[project.optional-dependencies]
+pdf = ["PyPDF2>=3.0.0", "pdfminer.six>=20221105"]
+audio = ["pyaudio", "soundfile", "sounddevice"]
+ai = ["openai>=1.0.0", "anthropic>=0.25.0", "groq"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["*"]

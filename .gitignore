@@ -1,0 +1,105 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Environment variables
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# File Retrieval GUI specific
+.file_copier_config.json
+.file_copier_cache.json
+temp/
+tmp/
+cache/
+outputs/
+backups/
+copied_files/
+
+# GUI temporary files
+*.tmp
+*.bak
+.thumbnails/
+screenshots/
+logs/
+
+# Assets - keep the directory but ignore temporary files
+assets/*.tmp
+assets/*.bak
+assets/temp_*
+
+# AI/LLM related
+model_cache/
+embeddings_cache/
+*.model
+*.weights
+
+# Audio processing
+*.wav
+*.mp3
+*.flac
+audio_temp/
+
+# Web server temp files
+websocket_logs/
+server_cache/
+
+# Test files
+test_files/
+sample_data/
+test_*.py
+*_test.py
+
+# Documentation temp files
+docs_temp/
+.sphinx_build/
+
+# Database files (if any)
+*.db
+*.sqlite
+*.sqlite3
+
+# Config backups
+*.config.bak
+config_backup_*/

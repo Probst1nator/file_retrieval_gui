@@ -1,0 +1,31 @@
+# File Retrieval GUI Dependencies
+
+# Install local packages in development mode
+-e core/
+-e shared/
+
+# Core GUI and Interface
+tkinter; platform_system != "Darwin"
+PyQt5>=5.15.0; platform_system != "Darwin"
+pyperclip>=1.8.0
+
+# File Processing
+PyMuPDF>=1.23.0  # PDF processing
+odfpy>=1.4.0     # ODT files
+python-magic>=0.4.27  # File type detection
+
+# AI Integration (minimal set)
+openai>=1.0.0
+anthropic>=0.25.0
+termcolor>=2.0.0
+python-dotenv>=1.0.0
+
+# Path Resolution and Utilities
+pathlib2>=2.3.7
+watchdog>=3.0.0
+
+# Image Processing (for screenshots and image handling)
+Pillow>=9.0.0
+
+# Development Tools
+pytest>=7.0.0
