@@ -420,7 +420,7 @@ class FileCopierApp:
         smart_paster_frame = ttk.Frame(tools_container)
         smart_paster_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 5))
 
-        ttk.Label(smart_paster_frame, text="Smart Paster (File Discovery)", font=("Segoe UI", 10, "bold")).pack(anchor='w')
+        ttk.Label(smart_paster_frame, text="Filepath Extractor", font=("Segoe UI", 10, "bold")).pack(anchor='w')
         self.smart_paste_text = scrolledtext.ScrolledText(smart_paster_frame, height=4, wrap=tk.WORD, bg=DARK_ENTRY_BG, fg=DARK_FG, insertbackground=DARK_FG, font=("Segoe UI", 10), borderwidth=0, highlightthickness=1)
         self.smart_paste_text.pack(fill=tk.BOTH, expand=True, pady=5)
         smart_paster_controls = ttk.Frame(smart_paster_frame)
@@ -1039,8 +1039,13 @@ class FileCopierApp:
         if self.drag_start_item:
             item_over = self.selected_files_tree.identify_row(event.y)
             if item_over and item_over != self.drag_start_item:
-                self.selected_files_tree.move(self.drag_start_item, "", self.selected_files_tree.index(item_over))
-                self._update_ui_state()
+                # Check if drag_start_item still exists in the tree
+                if self.selected_files_tree.exists(self.drag_start_item):
+                    self.selected_files_tree.move(self.drag_start_item, "", self.selected_files_tree.index(item_over))
+                    self._update_ui_state()
+                else:
+                    # Reset drag operation if item no longer exists
+                    self.drag_start_item = None
     
     def _add_file_to_selection(self, filepath: str) -> bool:
         if filepath in self.selected_files_map:

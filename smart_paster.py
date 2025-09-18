@@ -101,11 +101,17 @@ def parse_clipboard_for_paths_and_code(message: str, directory: str) -> Tuple[Li
             # Clean up potential path string
             cleaned_path = word.strip("'`.,:;")
             
-            # Construct absolute path
-            full_path = os.path.join(directory, cleaned_path.replace('/', os.sep))
+            # Resolve potential absolute or relative paths
+            base_directory = os.path.abspath(directory)
             
-            if os.path.exists(full_path) and os.path.isfile(full_path):
-                found_files_abs.add(os.path.abspath(full_path))
+            if os.path.isabs(cleaned_path):
+                candidate_path = os.path.normpath(cleaned_path)
+            else:
+                candidate_path = os.path.normpath(os.path.join(base_directory, cleaned_path))
+            
+            # Check if the file exists and is within the project directory
+            if os.path.isfile(candidate_path) and os.path.commonpath([base_directory, candidate_path]) == base_directory:
+                found_files_abs.add(candidate_path)
                 found_path_strings.add(cleaned_path)
 
     # Process orphan code blocks
@@ -242,86 +248,92 @@ async def process_smart_request(user_request: str, directory: str) -> List[str]:
     The main orchestrator for smart file discovery.
     Uses prioritized regex patterns and matching strategies to find the most accurate filepaths.
     """
-    # Get all files in the project first
-    all_files = []
-    for root, dirs, files in os.walk(directory, topdown=True):
+    # Ensure the base directory is an absolute path for reliable comparisons
+    base_directory = os.path.abspath(directory)
+
+    # Get all files in the project first, as relative paths
+    all_project_files = []
+    for root, dirs, files in os.walk(base_directory, topdown=True):
         dirs[:] = [d for d in dirs if d not in IGNORE_DIRS]
         for name in files:
             if name not in IGNORE_FILES and name != CACHE_FILENAME:
-                rel_path = os.path.relpath(os.path.join(root, name), directory).replace('\\', '/')
-                all_files.append(rel_path)
+                rel_path = os.path.relpath(os.path.join(root, name), base_directory).replace('\\', '/')
+                all_project_files.append(rel_path)
     
     matched_files = set()
+    
+    def _resolve_path(potential_path: str, all_files: List[str]) -> Optional[str]:
+        """
+        Resolves a potential path string against the project files.
+        - Handles both relative and absolute paths.
+        - Ensures the resolved file exists and is within the base directory.
+        - Tries partial matches like filename and basename if direct match fails.
+        - Returns the path relative to the base directory if valid, otherwise None.
+        """
+        cleaned_path = potential_path.strip("'`\".,;:")
+
+        # --- Strategy 1: Handle Absolute Paths ---
+        if os.path.isabs(cleaned_path):
+            candidate_abs_path = os.path.normpath(cleaned_path)
+            
+            # Security & Sanity Check: Is it inside our project directory?
+            if os.path.commonpath([base_directory, candidate_abs_path]) == base_directory:
+                if os.path.isfile(candidate_abs_path):
+                    return os.path.relpath(candidate_abs_path, base_directory).replace('\\', '/')
+            # If absolute path check fails, do not proceed to other strategies for it
+            return None
+
+        # --- Strategy 2: Handle Relative Paths (Exact Match) ---
+        if cleaned_path in all_files:
+            return cleaned_path
+        
+        candidate_abs_path = os.path.normpath(os.path.join(base_directory, cleaned_path))
+        if os.path.isfile(candidate_abs_path):
+            # Also verify it's within the project directory to prevent '..' escapes
+            if os.path.commonpath([base_directory, candidate_abs_path]) == base_directory:
+                 return os.path.relpath(candidate_abs_path, base_directory).replace('\\', '/')
+
+        # --- Strategy 3: Exact Filename Match ---
+        matching_files = [f for f in all_files if os.path.basename(f) == cleaned_path]
+        if matching_files:
+            return sorted(matching_files, key=len)[0]  # Prefer shorter paths
+
+        # --- Strategy 4: Basename Match (No Extension) ---
+        if '.' not in cleaned_path:
+            matching_files = [f for f in all_files if os.path.basename(f).split('.')[0] == cleaned_path]
+            if matching_files:
+                return sorted(matching_files, key=len)[0]
+
+        return None
     
     # Define extraction patterns in order of priority (most specific first)
     extraction_patterns = [
         # Priority 1: Markdown file references (most explicit)
-        ("file_ref", r'File:\s*([\w\-_./]+(?:\.[\w]+)?)', "File references"),
-        
+        ("file_ref", r'File:\s*([/\w\-_.]+)', "File references"),
         # Priority 2: Paths in quotes/backticks (explicitly marked)
-        ("quoted", r'[`"\']([\w\-_./]+(?:\.[\w]+)?)[`"\']', "Quoted paths"),
-        
-        # Priority 3: Files with line numbers (specific references)
-        ("line_ref", r'\b([\w\-_./]+\.[\w]+)(?:[:][0-9]+|#L[0-9]+)\b', "Line references"),
-        
-        # Priority 4: Absolute paths (full context)  
-        ("absolute", r'(?:^|\s)/[\w\-_./]+(?:\.[\w]+)?(?=\s|$)', "Absolute paths"),
-        
-        # Priority 5: Basic files with extensions (standard)
-        ("basic", r'\b[\w\-_./]+\.[\w]+\b', "Basic file patterns"),
-        
-        # Priority 6: Directory patterns without extensions (least specific)
-        ("no_ext", r'\b[\w\-_]+(?:/[\w\-_]+)+\b', "Directory patterns")
+        ("quoted", r'[`"\']([/\w\-_.]+)', "Quoted paths"),
+        # Priority 3: Absolute paths (e.g., /path/to/file.py)
+        ("absolute", r'\b(/[\w\-_./]+)\b', "Absolute paths"),
+        # Priority 4: Relative paths (e.g., path/to/file.py)
+        ("relative", r'\b([\w\-_]+\/[\w\-_./]+)\b', "Relative paths"),
+        # Priority 5: Filenames with extensions (e.g., file.py)
+        ("filename", r'\b([\w\-_]+\.[\w]+)\b', "Filenames"),
     ]
     
-    # Define matching strategies in order of priority (most specific first)
-    def try_match_file(potential_filepath: str, all_files: List[str]) -> Optional[str]:
-        """
-        Try to match a potential filepath using prioritized strategies.
-        Returns the first match found, or None if no match.
-        """
-        cleaned_filepath = potential_filepath.strip("'`\".,;:")
-        
-        # Strategy 1: Exact full path match (highest priority)
-        for file_path in all_files:
-            if file_path == cleaned_filepath:
-                return file_path
-        
-        # Strategy 2: Suffix match for absolute paths (high priority)
-        if cleaned_filepath.startswith('/'):
-            for file_path in all_files:
-                if file_path in cleaned_filepath:
-                    return file_path
-        
-        # Strategy 3: Exact filename match (medium priority)
-        # If multiple files have the same name, prefer the one with the shortest path (likely more relevant)
-        matching_files = [f for f in all_files if os.path.basename(f) == cleaned_filepath]
-        if matching_files:
-            # Sort by path length (shorter paths first, assuming they're more relevant)
-            return sorted(matching_files, key=len)[0]
-        
-        # Strategy 4: Basename match for paths without extension (lowest priority)
-        if '.' not in cleaned_filepath:
-            matching_files = [f for f in all_files if os.path.basename(f).split('.')[0] == cleaned_filepath]
-            if matching_files:
-                # Sort by path length (shorter paths first, assuming they're more relevant)
-                return sorted(matching_files, key=len)[0]
-        
-        return None
+    remaining_request = user_request
     
     # Process each extraction pattern in priority order
     for pattern_name, pattern_regex, pattern_desc in extraction_patterns:
-        potential_filepaths = re.findall(pattern_regex, user_request)
+        potential_filepaths = re.findall(pattern_regex, remaining_request)
         
         for potential_filepath in potential_filepaths:
-            # Only try to match if we haven't already matched this file
-            matched_file = try_match_file(potential_filepath, all_files)
+            matched_file = _resolve_path(potential_filepath, all_project_files)
+            
             if matched_file and matched_file not in matched_files:
                 matched_files.add(matched_file)
-                # Remove this file from the available files list to prevent duplicate matching
-                all_files = [f for f in all_files if f != matched_file]
-    
-    # Return sorted list
+                # Remove the found string to avoid re-matching by less specific patterns later
+                remaining_request = remaining_request.replace(potential_filepath, '')
+
     return sorted(list(matched_files))
 
 # --- Legacy functions for backward compatibility ---
