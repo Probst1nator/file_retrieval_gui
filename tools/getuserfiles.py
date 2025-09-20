@@ -48,6 +48,7 @@ class WebSocketDiscovery:
         
         # Check cache first (for rapid successive calls)
         if self._is_cache_valid():
+            assert self.cached_uri is not None  # _is_cache_valid() ensures this
             print(colored(f"🔄 Using cached WebSocket endpoint: {self.cached_uri}", "cyan"))
             return self.cached_uri
         
@@ -74,7 +75,7 @@ class WebSocketDiscovery:
     
     def _is_cache_valid(self) -> bool:
         """Check if cached URI is still valid"""
-        return (self.cached_uri and 
+        return (self.cached_uri is not None and
                 time.time() - self.cache_timestamp < self.cache_duration)
     
     def _cache_uri(self, uri: str):
@@ -170,8 +171,13 @@ class WebSocketDiscovery:
                 content = await asyncio.wait_for(websocket.recv(), timeout=timeout)
                 
                 # Basic validation - should not be an error message
-                if content and not content.startswith("Error:"):
-                    return True
+                if content:
+                    if isinstance(content, bytes):
+                        content_str = content.decode('utf-8', errors='ignore')
+                    else:
+                        content_str = content
+                    if not content_str.startswith("Error:"):
+                        return True
                     
         except (websockets.exceptions.ConnectionClosed, 
                 websockets.exceptions.WebSocketException,
@@ -271,13 +277,18 @@ class getuserfiles:
         except Exception as e:
             result = f"Error: {e}"
         
-        if result.startswith("Error:"):
-            print(colored(f"   -> {result}", "red"))
+        if isinstance(result, bytes):
+            result_str = result.decode('utf-8', errors='ignore')
         else:
-            size_kb = len(result) / 1024
+            result_str = result
+
+        if result_str.startswith("Error:"):
+            print(colored(f"   -> {result_str}", "red"))
+        else:
+            size_kb = len(result_str) / 1024
             print(colored(f"   -> Successfully received {size_kb:.1f} KB of context.", "green"))
-            
-        return result
+
+        return result_str
 
     @staticmethod
     def create_user_config(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT):

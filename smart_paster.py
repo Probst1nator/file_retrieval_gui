@@ -10,10 +10,6 @@ from odf import text, teletype
 from odf.opendocument import load as odf_load
 
 # Local import for the AI class
-try:
-    from .ai_path_finder import AIFixPath
-except ImportError:
-    from ai_path_finder import AIFixPath
 
 IGNORE_DIRS: Set[str] = {"__pycache__", "node_modules", "venv", "dist", "build", ".git", ".idea", ".vscode"}
 IGNORE_FILES: Set[str] = {".DS_Store", ".gitignore", ".env"}
@@ -231,17 +227,6 @@ def _is_likely_code_block(text: str) -> bool:
     # This allows instructional fragments to be captured
     return len(text.strip()) > 0
 
-async def handle_missing_filepaths(message: str, missed_code_blocks: List[str], directory: str) -> List[Tuple[str, str]]:
-    """Uses AI to find paths for orphan code blocks and returns them as a list of (path, code) pairs."""
-    project_tree = generate_project_tree(directory)
-    fixer = AIFixPath()
-    resolved_pairs = []
-    print(f"AI Assistant: Analyzing {len(missed_code_blocks)} orphan block(s)...")
-    for block in missed_code_blocks:
-        suggested_path = await fixer.find_path(code_block=block, full_project_context=message, project_tree=project_tree)
-        if suggested_path:
-            resolved_pairs.append((suggested_path, block))
-    return resolved_pairs
 
 async def process_smart_request(user_request: str, directory: str) -> List[str]:
     """
@@ -373,7 +358,7 @@ def build_clipboard_content(file_paths: List[str], root_directory: str, max_size
                 content = ""
                 with fitz.open(abs_path) as doc:
                     for page in doc:
-                        content += page.get_text()
+                        content += page.get_text()  # type: ignore
                 block = f"# {rel_path}\n```text\n{content.strip()}\n```"
             elif ext == '.odt':
                 doc = odf_load(abs_path)

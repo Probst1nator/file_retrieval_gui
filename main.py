@@ -33,7 +33,7 @@ def _check_getuserfiles_available() -> bool:
         if tools_path not in sys.path:
             sys.path.insert(0, tools_path)
         
-        from getuserfiles import WebSocketDiscovery
+        from getuserfiles import WebSocketDiscovery  # type: ignore
         
         # Handle async properly
         try:

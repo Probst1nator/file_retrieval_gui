@@ -21,7 +21,7 @@ except ImportError:
     pyperclip = None
 
 try:
-    from ctypes import windll
+    from ctypes import windll  # type: ignore
 except (ImportError, AttributeError):
     windll = None # Define as None on non-Windows systems
 
@@ -106,11 +106,11 @@ class FileCopierApp:
         self.supported_binary_ext = {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp', '.pdf', '.odt'}
 
     def _initialize_websocket_state(self):
-        self.websocket_server: Optional[websockets.server.Serve] = None
+        self.websocket_server = None  # type: ignore
         self.websocket_loop: Optional[asyncio.AbstractEventLoop] = None
         self.connected_clients = set()
         # FIXED: Corrected type hint for websockets
-        self.client_info: Dict[websockets.WebSocketServerProtocol, Dict] = {}
+        self.client_info = {}  # type: ignore
         self.current_shared_string = "File Copier GUI is running, but no files have been selected yet."
         self.websocket_enabled = True
         self.websocket_start_time: Optional[datetime] = None
@@ -168,7 +168,7 @@ class FileCopierApp:
         await self.websocket_server.wait_closed()
 
     # FIXED: Corrected type hint for websockets
-    async def _websocket_handler(self, websocket: websockets.WebSocketServerProtocol):
+    async def _websocket_handler(self, websocket):  # type: ignore
         client_address = f"{websocket.remote_address[0]}:{websocket.remote_address[1]}" if websocket.remote_address else "unknown"
         connect_time = datetime.now()
         
@@ -1091,7 +1091,8 @@ class FileCopierApp:
                 if (self.websocket_loop and not self.websocket_loop.is_closed() and self.websocket_loop.is_running()):
                     def close_server():
                         try:
-                            asyncio.create_task(self.websocket_server.wait_closed())
+                            if self.websocket_server:
+                                asyncio.create_task(self.websocket_server.wait_closed())
                         except Exception:
                             pass
                     self.websocket_loop.call_soon_threadsafe(close_server)
