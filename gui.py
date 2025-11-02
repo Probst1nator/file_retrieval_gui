@@ -78,6 +78,22 @@ def get_script_directory() -> str:
     except NameError:
         return os.getcwd()
 
+def format_filesize(size_bytes: int) -> str:
+    """Format file size adaptively (KB/MB/GB)."""
+    if size_bytes < 1024:
+        return f"{size_bytes} B"
+    elif size_bytes < 1024 * 1024:
+        return f"{size_bytes / 1024:.2f} KB"
+    elif size_bytes < 1024 * 1024 * 1024:
+        return f"{size_bytes / (1024 * 1024):.2f} MB"
+    else:
+        return f"{size_bytes / (1024 * 1024 * 1024):.2f} GB"
+
+def format_timestamp(timestamp: float) -> str:
+    """Format timestamp as absolute datetime with second precision."""
+    dt = datetime.fromtimestamp(timestamp)
+    return dt.strftime('%Y-%m-%d %H:%M:%S')
+
 class FileCopierApp:
     def __init__(self, root: tk.Tk, directory: str):
         self.root = root
@@ -96,6 +112,7 @@ class FileCopierApp:
 
     def _initialize_state(self):
         self.selected_files_map: Dict[str, bool] = {}
+        self.file_metadata: Dict[str, Dict] = {}  # Store raw metadata for sorting
         self.preview_visible = False
         self.all_text_files: List[str] = []
         self._search_job: Optional[str] = None
@@ -104,6 +121,9 @@ class FileCopierApp:
         self.presets: Dict[str, Dict] = {}
         self.drag_start_item: Optional[str] = None
         self.supported_binary_ext = {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp', '.pdf', '.odt'}
+        self.sort_column: Optional[str] = None
+        self.sort_reverse: bool = False
+        self.drag_enabled: bool = True
 
     def _initialize_websocket_state(self):
         self.websocket_server = None  # type: ignore
@@ -375,11 +395,17 @@ class FileCopierApp:
         selection_tree_frame.grid_rowconfigure(0, weight=1)
         selection_tree_frame.grid_columnconfigure(0, weight=1)
         
-        self.selected_files_tree = ttk.Treeview(selection_tree_frame, columns=("filepath", "char_count"), show="headings", selectmode="extended")
+        self.selected_files_tree = ttk.Treeview(selection_tree_frame, columns=("filepath", "filetype", "filesize", "char_count", "changed"), show="headings", selectmode="extended")
         self.selected_files_tree.heading("filepath", text="File Path")
+        self.selected_files_tree.heading("filetype", text="Type", anchor='center')
+        self.selected_files_tree.heading("filesize", text="Size", anchor='e')
         self.selected_files_tree.heading("char_count", text="Characters", anchor='e')
-        self.selected_files_tree.column("filepath", width=350, stretch=tk.YES)
+        self.selected_files_tree.heading("changed", text="Modified", anchor='e')
+        self.selected_files_tree.column("filepath", width=250, stretch=tk.YES)
+        self.selected_files_tree.column("filetype", width=60, stretch=tk.NO, anchor='center')
+        self.selected_files_tree.column("filesize", width=80, stretch=tk.NO, anchor='e')
         self.selected_files_tree.column("char_count", width=100, stretch=tk.NO, anchor='e')
+        self.selected_files_tree.column("changed", width=140, stretch=tk.NO, anchor='e')
         
         self.selected_files_tree.tag_configure('unsupported', foreground=DARK_ERROR_FG)
 
@@ -523,6 +549,9 @@ class FileCopierApp:
         self.selected_files_tree.bind("<Key-Delete>", lambda e: self.remove_selected())
         self.selected_files_tree.bind("<Control-a>", self.select_all_files)
         self.selected_files_tree.bind("<Command-a>", self.select_all_files)
+        # Bind column header clicks for sorting
+        for col in ["filepath", "filetype", "filesize", "char_count", "changed"]:
+            self.selected_files_tree.heading(col, command=lambda c=col: self._on_column_click(c))
         self.preset_combobox.bind("<<ComboboxSelected>>", self.on_preset_selected)
         self.search_var.trace_add("write", self._debounce_search)
         self.exclude_dirs_var.trace_add("write", self._debounce_search)
@@ -987,6 +1016,101 @@ class FileCopierApp:
             self.selected_files_tree.selection_set(all_items)
         return "break"  # Prevent further event propagation
 
+    def _on_column_click(self, column: str):
+        """Handle column header click to sort files."""
+        # Toggle sort direction if same column, otherwise default to ascending
+        if self.sort_column == column:
+            self.sort_reverse = not self.sort_reverse
+        else:
+            self.sort_column = column
+            self.sort_reverse = False
+
+        # Disable drag and drop while sorted
+        self.drag_enabled = False
+
+        # Perform the sort
+        self._sort_selected_files()
+
+        # Update header text to show sort indicator
+        self._update_column_headers()
+
+    def _update_column_headers(self):
+        """Update column headers to show sort indicators."""
+        headers = {
+            "filepath": "File Path",
+            "filetype": "Type",
+            "filesize": "Size",
+            "char_count": "Characters",
+            "changed": "Modified"
+        }
+
+        for col, text in headers.items():
+            if col == self.sort_column:
+                indicator = " ▼" if self.sort_reverse else " ▲"
+                self.selected_files_tree.heading(col, text=text + indicator)
+            else:
+                self.selected_files_tree.heading(col, text=text)
+
+    def _sort_selected_files(self):
+        """Sort files in the tree by the current sort column."""
+        if not self.sort_column:
+            return
+
+        # Gather all items with their data
+        items = []
+        for item_id in self.selected_files_tree.get_children():
+            values = self.selected_files_tree.item(item_id, "values")
+            tags = self.selected_files_tree.item(item_id, "tags")
+            items.append((values, tags))
+
+        # Define sort key based on column
+        def get_sort_key(item):
+            values = item[0]
+            filepath = values[0]  # First column is always filepath
+
+            col_index = {
+                "filepath": 0,
+                "filetype": 1,
+                "filesize": 2,
+                "char_count": 3,
+                "changed": 4
+            }[self.sort_column]
+
+            value = values[col_index] if col_index < len(values) else ""
+
+            # Handle special cases for numeric columns using stored metadata
+            if self.sort_column == "filesize":
+                # Use raw bytes from metadata for proper sorting
+                metadata = self.file_metadata.get(filepath, {})
+                return metadata.get('filesize_bytes', 0)
+
+            elif self.sort_column == "char_count":
+                # Handle "N/A" and numeric values
+                try:
+                    return int(value.replace(",", "")) if value != "N/A" else -1
+                except (ValueError, AttributeError):
+                    return -1
+
+            elif self.sort_column == "changed":
+                # Use raw timestamp from metadata for proper sorting
+                metadata = self.file_metadata.get(filepath, {})
+                return metadata.get('timestamp', 0)
+
+            # For text columns, use natural string sorting
+            return str(value).lower()
+
+        # Sort items
+        items.sort(key=get_sort_key, reverse=self.sort_reverse)
+
+        # Clear tree and repopulate in sorted order
+        for item_id in self.selected_files_tree.get_children():
+            self.selected_files_tree.delete(item_id)
+
+        for values, tags in items:
+            self.selected_files_tree.insert("", tk.END, values=values, tags=tags)
+
+        self._update_ui_state()
+
     def remove_selected(self):
         selection = self.selected_files_tree.selection()
         if selection:
@@ -996,12 +1120,15 @@ class FileCopierApp:
                 self.selected_files_tree.delete(selected_item)
                 if fp in self.selected_files_map:
                     del self.selected_files_map[fp]
+                if fp in self.file_metadata:
+                    del self.file_metadata[fp]
             self._update_ui_state()
 
     def clear_all(self, auto_save: bool = True):
         for item in self.selected_files_tree.get_children():
             self.selected_files_tree.delete(item)
         self.selected_files_map.clear()
+        self.file_metadata.clear()
         self._update_ui_state(auto_save=auto_save)
 
     def update_selected_count(self):
@@ -1033,28 +1160,62 @@ class FileCopierApp:
         self._log_message(f"Copied {len(selected)} file(s) to clipboard! ({size_kb:.1f} KB)", 'success')
 
     def on_drag_start(self, event: tk.Event):
+        if not self.drag_enabled:
+            return
         self.drag_start_item = self.selected_files_tree.identify_row(event.y)
 
     def on_drag_motion(self, event: tk.Event):
-        if self.drag_start_item:
-            item_over = self.selected_files_tree.identify_row(event.y)
-            if item_over and item_over != self.drag_start_item:
-                # Check if drag_start_item still exists in the tree
-                if self.selected_files_tree.exists(self.drag_start_item):
-                    self.selected_files_tree.move(self.drag_start_item, "", self.selected_files_tree.index(item_over))
-                    self._update_ui_state()
-                else:
-                    # Reset drag operation if item no longer exists
-                    self.drag_start_item = None
+        if not self.drag_enabled or not self.drag_start_item:
+            return
+
+        item_over = self.selected_files_tree.identify_row(event.y)
+        if item_over and item_over != self.drag_start_item:
+            # Check if drag_start_item still exists in the tree
+            if self.selected_files_tree.exists(self.drag_start_item):
+                self.selected_files_tree.move(self.drag_start_item, "", self.selected_files_tree.index(item_over))
+                self._update_ui_state()
+            else:
+                # Reset drag operation if item no longer exists
+                self.drag_start_item = None
     
     def _add_file_to_selection(self, filepath: str) -> bool:
         if filepath in self.selected_files_map:
             return False
-        
+
         self.selected_files_map[filepath] = True
+
+        # Gather file metadata
+        full_path = os.path.join(self.directory, filepath)
+
+        # Get file type (extension)
+        filetype = os.path.splitext(filepath)[1] or "N/A"
+
+        # Get file size and timestamp
+        try:
+            file_stat = os.stat(full_path)
+            filesize_bytes = file_stat.st_size
+            filesize_str = format_filesize(filesize_bytes)
+            timestamp = file_stat.st_mtime
+
+            # Get last modified time
+            changed_str = format_timestamp(timestamp)
+
+            # Store raw metadata for sorting
+            self.file_metadata[filepath] = {
+                'filesize_bytes': filesize_bytes,
+                'timestamp': timestamp
+            }
+        except (OSError, FileNotFoundError):
+            filesize_str = "N/A"
+            changed_str = "N/A"
+            self.file_metadata[filepath] = {
+                'filesize_bytes': 0,
+                'timestamp': 0
+            }
+
+        # Get character count (existing logic)
         char_count_str = "N/A"
         try:
-            full_path = os.path.join(self.directory, filepath)
             if is_text_file(full_path):
                 with open(full_path, 'r', encoding='utf-8', errors='ignore') as f:
                     char_count_str = f"{len(f.read()):,}"
@@ -1062,7 +1223,7 @@ class FileCopierApp:
             pass # Keep N/A
 
         tags = () if self._is_file_content_supported(filepath) else ('unsupported',)
-        self.selected_files_tree.insert("", tk.END, values=(filepath, char_count_str), tags=tags)
+        self.selected_files_tree.insert("", tk.END, values=(filepath, filetype, filesize_str, char_count_str, changed_str), tags=tags)
         return True
 
     # --- WebSocket Server Control Methods ---
