@@ -2,7 +2,7 @@
 """
 File Provider Tool with Dynamic WebSocket Discovery
 
-This tool connects to the File Copier GUI to retrieve the current file selection
+This tool connects to the File Retrieval GUI to retrieve the current file selection
 and their contents. It uses a multi-tier discovery mechanism to find the active
 WebSocket server automatically.
 

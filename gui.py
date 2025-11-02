@@ -111,7 +111,7 @@ class FileCopierApp:
         self.connected_clients = set()
         # FIXED: Corrected type hint for websockets
         self.client_info = {}  # type: ignore
-        self.current_shared_string = "File Copier GUI is running, but no files have been selected yet."
+        self.current_shared_string = "File Retrieval GUI is running, but no files have been selected yet."
         self.websocket_enabled = True
         self.websocket_start_time: Optional[datetime] = None
         self.connections_refresh_job: Optional[str] = None
@@ -258,7 +258,7 @@ class FileCopierApp:
         self.preview_text.config(state=tk.DISABLED)
 
     def _setup_styles(self):
-        self.root.title(f"File Copier - {os.path.basename(self.directory)}")
+        self.root.title(f"File Retrieval GUI - {os.path.basename(self.directory)}")
         self.root.geometry("1400x900")
         self.root.configure(bg=DARK_BG)
         style = ttk.Style()

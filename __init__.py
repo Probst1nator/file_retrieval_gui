@@ -1,5 +1,5 @@
 """
-File Copier Tool
+File Retrieval GUI
 
 A GUI and CLI tool for intelligent file discovery and clipboard management.
 Features smart file path detection and AI-powered file finding capabilities.
