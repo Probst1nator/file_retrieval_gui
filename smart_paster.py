@@ -365,6 +365,17 @@ def build_clipboard_content(file_paths: List[str], root_directory: str, max_size
                 all_paragraphs = doc.getElementsByType(text.P)
                 content = "\n".join(teletype.extractText(p) for p in all_paragraphs)
                 block = f"# {rel_path}\n```text\n{content.strip()}\n```"
+            elif ext == '.csv':
+                with open(abs_path, 'r', encoding='utf-8', errors='replace') as f:
+                    lines = f.readlines()
+                
+                if len(lines) > 20:
+                    content = "".join(lines[:10])
+                    content += f"\n... {len(lines) - 10} more rows hidden ..."
+                else:
+                    content = "".join(lines)
+                
+                block = f"# {rel_path}\n```csv\n{content.strip()}\n```"
             else:
                 try: # Check if it's a text file before reading
                     with open(abs_path, 'rb') as f:
