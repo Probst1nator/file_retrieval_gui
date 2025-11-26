@@ -370,8 +370,9 @@ def build_clipboard_content(file_paths: List[str], root_directory: str, max_size
                     lines = f.readlines()
                 
                 if len(lines) > 20:
-                    content = "".join(lines[:10])
-                    content += f"\n... {len(lines) - 10} more rows hidden ..."
+                    content = "".join(lines[:5])
+                    content += f"\n... {len(lines) - 10} more rows hidden ...\n"
+                    content += "".join(lines[-5:])
                 else:
                     content = "".join(lines)
                 
