@@ -21,6 +21,12 @@ except ImportError:
     pyperclip = None
 
 try:
+    from PIL import Image, ImageTk
+except ImportError:
+    Image = None
+    ImageTk = None
+
+try:
     from ctypes import windll  # type: ignore
 except (ImportError, AttributeError):
     windll = None # Define as None on non-Windows systems
@@ -279,6 +285,56 @@ class FileCopierApp:
 
     def _setup_styles(self):
         self.root.title(f"File Retrieval GUI - {os.path.basename(self.directory)}")
+
+        # Set window class for proper taskbar identification
+        try:
+            self.root.tk.call('wm', 'class', self.root._w, 'FileRetrievalGUI')
+        except Exception:
+            pass
+
+        # Set window icon - load multiple resolutions for crisp display
+        icon_png_path = os.path.join(get_script_directory(), "assets", "Icon.png")
+
+        if os.path.exists(icon_png_path) and Image and ImageTk:
+            try:
+                # Load original PNG
+                original = Image.open(icon_png_path)
+
+                # Crop transparent padding to make icon larger in taskbar
+                if original.mode == 'RGBA':
+                    # Get bounding box of non-transparent content
+                    bbox = original.getbbox()
+                    if bbox:
+                        original = original.crop(bbox)
+
+                # Provide full range of icon sizes - taskbar picks what it needs
+                # Most taskbars use 32-64px, but we provide more for flexibility
+                icon_sizes = [256, 128, 96, 64, 48, 32, 24, 16]
+                icon_images = []
+
+                for size in icon_sizes:
+                    # Maintain aspect ratio by fitting into square canvas
+                    img_copy = original.copy()
+                    img_copy.thumbnail((size, size), Image.Resampling.LANCZOS)
+
+                    # Create square transparent canvas
+                    square_img = Image.new('RGBA', (size, size), (0, 0, 0, 0))
+
+                    # Center the icon on the canvas
+                    offset = ((size - img_copy.width) // 2, (size - img_copy.height) // 2)
+                    square_img.paste(img_copy, offset, img_copy if img_copy.mode == 'RGBA' else None)
+
+                    photo = ImageTk.PhotoImage(square_img)
+                    icon_images.append(photo)
+
+                # Pass all sizes to iconphoto (first arg True = apply to future windows too)
+                self.root.iconphoto(True, *icon_images)
+
+                # Keep references to prevent garbage collection
+                self.icon_images = icon_images
+            except Exception as e:
+                print(f"Warning: Could not load icon: {e}")
+
         self.root.geometry("1400x900")
         self.root.configure(bg=DARK_BG)
         style = ttk.Style()

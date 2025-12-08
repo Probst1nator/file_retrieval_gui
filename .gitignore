@@ -103,3 +103,5 @@ docs_temp/
 # Config backups
 *.config.bak
 config_backup_*/
+
+*.xcf
