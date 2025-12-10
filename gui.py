@@ -130,6 +130,7 @@ class FileCopierApp:
         self.sort_column: Optional[str] = None
         self.sort_reverse: bool = False
         self.drag_enabled: bool = True
+        self._copy_timer: Optional[str] = None  # Timer for the 'Copied!' label
 
     def _initialize_websocket_state(self):
         self.websocket_server = None  # type: ignore
@@ -385,8 +386,13 @@ class FileCopierApp:
         bottom_controls_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=(10, 0))
         self.btn_toggle_preview = ttk.Button(bottom_controls_frame, text="Show Preview", command=self.toggle_preview)
         self.btn_toggle_preview.pack(side=tk.LEFT)
+        
         self.btn_copy = ttk.Button(bottom_controls_frame, text="Copy to Clipboard", command=self.copy_to_clipboard, style='Accent.TButton')
         self.btn_copy.pack(side=tk.RIGHT)
+        
+        # New label for "Copied!" notification - packed to the RIGHT (so it appears left of the copy button)
+        self.copied_label = ttk.Label(bottom_controls_frame, text="", foreground="#4CAF50", font=("Segoe UI", 10, "bold"))
+        self.copied_label.pack(side=tk.RIGHT, padx=(0, 10))
 
         self.preview_frame = ttk.Frame(self.main_container)
         self._create_preview_widgets()
@@ -1212,6 +1218,13 @@ class FileCopierApp:
         self.root.update_idletasks()
         out = build_clipboard_content([os.path.join(self.directory, f) for f in selected], self.directory)
         pyperclip.copy(out)
+        
+        # Show temporary "Copied!" label
+        self.copied_label.config(text="Copied!")
+        if self._copy_timer:
+            self.root.after_cancel(self._copy_timer)
+        self._copy_timer = self.root.after(1000, lambda: self.copied_label.config(text=""))
+        
         size_kb = len(out) / 1024
         self._log_message(f"Copied {len(selected)} file(s) to clipboard! ({size_kb:.1f} KB)", 'success')
 

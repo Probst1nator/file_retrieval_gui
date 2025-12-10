@@ -403,14 +403,19 @@ def preview_changes_to_files(content_to_apply: str, root_directory: str) -> List
     """
     changes: List[FileChange] = []
     
-    # Use the same regex patterns as apply_changes_to_files
-    pattern = re.compile(r"^#\s*([^\n]+?)\s*\n```(?:[a-zA-Z0-9]*)?\n(.*?)\n```", re.DOTALL | re.MULTILINE)
+    # Pattern supports two formats:
+    # Format 1 (backticks): ### 1. `path/to/file.ext`
+    # Format 2 (simple): # path/to/file.ext
+    # Both require file extensions to distinguish from markdown headings
+    pattern = re.compile(r"^#+\s*(?:\d+\.\s*)?(?:`([^`]+\.[a-zA-Z0-9]+)`|([^\s`]+\.[a-zA-Z0-9]+)).*?\n```(?:[a-zA-Z0-9]*)?\n(.*?)\n```", re.DOTALL | re.MULTILINE)
     if not pattern.search(content_to_apply):
-        pattern = re.compile(r"^```(?:[a-zA-Z0-9]*)?\n\s*#\s*([^\n]+?)\n(.*?)\n```", re.DOTALL | re.MULTILINE)
+        # Fallback: code block with # path inside
+        pattern = re.compile(r"^```(?:[a-zA-Z0-9]*)?\n\s*#\s*(?:`([^`]+\.[a-zA-Z0-9]+)`|([^\s`]+\.[a-zA-Z0-9]+))\n(.*?)\n```", re.DOTALL | re.MULTILINE)
 
-    for file_path, content in pattern.findall(content_to_apply):
-        file_path = file_path.strip()
-        
+    for match in pattern.finditer(content_to_apply):
+        file_path = (match.group(1) or match.group(2)).strip()
+        content = match.group(3)
+
         # Validate path safety
         if ".." in file_path or os.path.isabs(file_path):
             changes.append(FileChange(
@@ -482,12 +487,18 @@ def apply_selected_changes(changes: List[FileChange]) -> Dict[str, List[str]]:
 
 def apply_changes_to_files(content_to_apply: str, root_directory: str) -> Dict[str, List[str]]:
     results: Dict[str, List[str]] = {"success": [], "errors": []}
-    pattern = re.compile(r"^#\s*([^\n]+?)\s*\n```(?:[a-zA-Z0-9]*)?\n(.*?)\n```", re.DOTALL | re.MULTILINE)
+    # Pattern supports two formats:
+    # Format 1 (backticks): ### 1. `path/to/file.ext`
+    # Format 2 (simple): # path/to/file.ext
+    # Both require file extensions to distinguish from markdown headings
+    pattern = re.compile(r"^#+\s*(?:\d+\.\s*)?(?:`([^`]+\.[a-zA-Z0-9]+)`|([^\s`]+\.[a-zA-Z0-9]+)).*?\n```(?:[a-zA-Z0-9]*)?\n(.*?)\n```", re.DOTALL | re.MULTILINE)
     if not pattern.search(content_to_apply):
-        pattern = re.compile(r"^```(?:[a-zA-Z0-9]*)?\n\s*#\s*([^\n]+?)\n(.*?)\n```", re.DOTALL | re.MULTILINE)
+        # Fallback: code block with # path inside
+        pattern = re.compile(r"^```(?:[a-zA-Z0-9]*)?\n\s*#\s*(?:`([^`]+\.[a-zA-Z0-9]+)`|([^\s`]+\.[a-zA-Z0-9]+))\n(.*?)\n```", re.DOTALL | re.MULTILINE)
 
-    for file_path, content in pattern.findall(content_to_apply):
-        file_path = file_path.strip()
+    for match in pattern.finditer(content_to_apply):
+        file_path = (match.group(1) or match.group(2)).strip()
+        content = match.group(3)
         if ".." in file_path or os.path.isabs(file_path):
             results["errors"].append(f"Skipped unsafe path: {file_path}")
             continue
