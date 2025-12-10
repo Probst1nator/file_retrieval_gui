@@ -1220,10 +1220,11 @@ class FileCopierApp:
         pyperclip.copy(out)
         
         # Show temporary "Copied!" label
-        self.copied_label.config(text="Copied!")
+        formatted_len = f"{len(out):,}".replace(",", ".")
+        self.copied_label.config(text=f"Copied! ({formatted_len} chars)")
         if self._copy_timer:
             self.root.after_cancel(self._copy_timer)
-        self._copy_timer = self.root.after(1000, lambda: self.copied_label.config(text=""))
+        self._copy_timer = self.root.after(3000, lambda: self.copied_label.config(text=""))
         
         size_kb = len(out) / 1024
         self._log_message(f"Copied {len(selected)} file(s) to clipboard! ({size_kb:.1f} KB)", 'success')
