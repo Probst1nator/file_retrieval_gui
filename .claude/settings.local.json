@@ -2,7 +2,8 @@
   "permissions": {
     "allow": [
       "Bash(pyright:*)",
-      "Bash(find:*)"
+      "Bash(find:*)",
+      "Bash(python -m py_compile:*)"
     ],
     "deny": [],
     "ask": []

@@ -4,7 +4,9 @@ import sys
 import json
 import tkinter as tk
 from tkinter import ttk, messagebox, scrolledtext, simpledialog
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
+from dataclasses import dataclass, field
+from enum import Enum
 import threading
 import asyncio
 import fnmatch
@@ -36,7 +38,14 @@ except (ImportError, AttributeError):
 current_dir = os.path.dirname(os.path.abspath(__file__))
 if current_dir not in sys.path:
     sys.path.insert(0, current_dir)
-from smart_paster import apply_changes_to_files, preview_changes_to_files, apply_selected_changes, IGNORE_DIRS, build_clipboard_content, process_smart_request, FileChange, ChangeType
+from smart_paster import (
+    apply_changes_to_files, preview_changes_to_files, apply_selected_changes,
+    apply_changes_with_history, apply_selected_with_history,
+    validate_file_state, apply_snapshots,
+    ApplyHistoryManager, FileSnapshot, ApplyOperation,
+    IGNORE_DIRS, build_clipboard_content, process_smart_request, FileChange, ChangeType
+)
+from ollama_client import OllamaClient, OllamaConfig
 
 # Load environment variables after imports
 load_dotenv()
@@ -64,6 +73,35 @@ CONFIG_FILENAME = ".file_copier_config.json"
 DARK_BG, DARK_FG, DARK_SELECT_BG = "#2b2b2b", "#ffffff", "#404040"
 DARK_ENTRY_BG, DARK_BUTTON_BG, DARK_TREE_BG = "#3c3c3c", "#404040", "#2b2b2b"
 DARK_ERROR_FG = "#F44336" # Red for errors/unsupported files
+
+# Chat bubble colors for Agentic Search
+BUBBLE_USER_BG = "#0078d4"      # Blue (matches Accent.TButton)
+BUBBLE_AGENT_BG = "#404040"     # Dark gray
+BUBBLE_USER_FG = "#ffffff"
+BUBBLE_AGENT_FG = "#ffffff"
+
+# File extraction pattern for agent responses
+FILE_EXTRACTION_PATTERN = re.compile(r'\[FILES?:\s*([^\]]+)\]', re.IGNORECASE)
+
+
+class MessageRole(Enum):
+    """Role of a chat message."""
+    USER = "user"
+    ASSISTANT = "assistant"
+    SYSTEM = "system"
+
+
+@dataclass
+class ChatMessage:
+    """Represents a single chat message in the agentic search interface."""
+    role: MessageRole
+    content: str
+    timestamp: datetime = field(default_factory=datetime.now)
+    extracted_files: List[str] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, str]:
+        """Convert to dict for Ollama API."""
+        return {"role": self.role.value, "content": self.content}
 
 def is_text_file(filepath: str) -> bool:
     try:
@@ -107,6 +145,7 @@ class FileCopierApp:
         self.config_file_path = os.path.join(get_script_directory(), CONFIG_FILENAME)
         self._initialize_state()
         self._initialize_websocket_state()
+        self._initialize_agentic_search_state()
         self._setup_styles()
         self._create_widgets()
         self._bind_events()
@@ -131,6 +170,38 @@ class FileCopierApp:
         self.sort_reverse: bool = False
         self.drag_enabled: bool = True
         self._copy_timer: Optional[str] = None  # Timer for the 'Copied!' label
+        self.apply_history = ApplyHistoryManager()  # History for undo/redo
+
+    def _initialize_agentic_search_state(self):
+        """Initialize state for the Agentic Search tab."""
+        self.chat_history: List[ChatMessage] = []
+        self.ollama_client: Optional[OllamaClient] = None
+        self.ollama_model_var: Optional[tk.StringVar] = None
+        self.ollama_status_var: Optional[tk.StringVar] = None
+        self.tool_vars: Dict[str, tk.BooleanVar] = {}
+        self.current_streaming_bubble: Optional[tk.Text] = None
+        self.chat_inner_frame: Optional[ttk.Frame] = None
+        self.chat_canvas: Optional[tk.Canvas] = None
+        self.agentic_search_enabled: bool = True
+        self._agent_tools: Set[str] = set()
+        self._waiting_animation_job: Optional[str] = None
+        self._waiting_animation_state: int = 0
+        self._generation_in_progress: bool = False
+        self._stop_generation: bool = False
+        self._load_agent_tools()
+
+    def _load_agent_tools(self):
+        """Load available tools from agent module."""
+        try:
+            # Try to import agent tools dynamically
+            agent_path = os.path.join(os.path.dirname(__file__), 'agent')
+            if agent_path not in sys.path:
+                sys.path.insert(0, agent_path)
+            from agent.main import INTERRUPTING_TAGS
+            self._agent_tools = set(INTERRUPTING_TAGS)
+        except ImportError:
+            # Fallback to default tools if agent module not available
+            self._agent_tools = {'readfile', 'grepsearch', 'filesystem', 'fileinfo', 'textprocess'}
 
     def _initialize_websocket_state(self):
         self.websocket_server = None  # type: ignore
@@ -209,9 +280,11 @@ class FileCopierApp:
         self._log_message(f"New client connected from {client_address} ({len(self.connected_clients)} total).", "info")
         try:
             await websocket.send(self.current_shared_string)
-            async for _ in websocket:
+            async for message in websocket:
                 if websocket in self.client_info:
                     self.client_info[websocket]['last_activity'] = datetime.now()
+                # Process incoming messages for agentic search
+                await self._process_websocket_message(message, websocket)
         except websockets.exceptions.ConnectionClosed:
             self._log_message(f"Client {client_address} connection closed.", "info")
         except Exception as e:
@@ -238,6 +311,39 @@ class FileCopierApp:
         
         if len(clients_to_send) > len(failed_clients):
              self._log_message(f"Broadcasted update to {len(clients_to_send) - len(failed_clients)} client(s).")
+
+    async def _process_websocket_message(self, message: str, websocket):
+        """Handle incoming WebSocket messages for agentic search."""
+        try:
+            data = json.loads(message)
+            msg_type = data.get("type")
+
+            if msg_type == "agentic_search_query":
+                # Inject query into chat from external client
+                query = data.get("query", "")
+                self.root.after(0, lambda: self._inject_external_query(query))
+
+            elif msg_type == "agentic_search_response":
+                # External service sending a response to display
+                response = data.get("response", "")
+                self.root.after(0, lambda: self._inject_external_response(response))
+
+            elif msg_type == "get_status":
+                # Return current status
+                status = {
+                    "type": "status_response",
+                    "ollama_connected": self.ollama_client.is_available() if self.ollama_client else False,
+                    "model": self.ollama_model_var.get() if self.ollama_model_var else None,
+                    "chat_history_length": len(self.chat_history),
+                    "enabled_tools": [t for t, var in self.tool_vars.items() if var.get()]
+                }
+                await websocket.send(json.dumps(status))
+
+        except json.JSONDecodeError:
+            # Not a JSON message, ignore (could be legacy format)
+            pass
+        except Exception as e:
+            self._log_message(f"Error processing WebSocket message: {e}", "error")
 
     def _get_selected_files_ordered(self) -> List[str]:
         return [self.selected_files_tree.item(item, "values")[0] for item in self.selected_files_tree.get_children("")]
@@ -364,6 +470,8 @@ class FileCopierApp:
         style.configure("TCheckbutton", background=DARK_BG, foreground=DARK_FG)
         style.configure('Accent.TButton', font=(base_font[0], base_font[1], "bold"), background="#0078d4", foreground=DARK_FG)
         style.map('Accent.TButton', background=[('active', '#106ebe')])
+        style.configure('Danger.TButton', font=(base_font[0], base_font[1], "bold"), background="#d32f2f", foreground=DARK_FG)
+        style.map('Danger.TButton', background=[('active', '#b71c1c')])
         style.configure("TNotebook", background=DARK_BG, borderwidth=0)
         style.configure("TNotebook.Tab", background=DARK_BUTTON_BG, foreground=DARK_FG, padding=[8, 4])
         style.map("TNotebook.Tab", background=[("selected", DARK_SELECT_BG)], expand=[("selected", [1, 1, 1, 0])])
@@ -371,30 +479,35 @@ class FileCopierApp:
     def _create_widgets(self):
         self.main_container = ttk.Frame(self.root, padding=10)
         self.main_container.pack(fill=tk.BOTH, expand=True)
-        vertical_pane = ttk.PanedWindow(self.main_container, orient=tk.VERTICAL)
-        vertical_pane.pack(fill=tk.BOTH, expand=True)
-        self.top_pane = ttk.PanedWindow(vertical_pane, orient=tk.HORIZONTAL)
-        vertical_pane.add(self.top_pane, weight=4)
-        bottom_pane_container = ttk.Frame(vertical_pane)
-        vertical_pane.add(bottom_pane_container, weight=2)
-        
+
+        # Create bottom controls frame first so it stays visible
+        bottom_controls_frame = ttk.Frame(self.main_container)
+        bottom_controls_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=(10, 0))
+
+        self.preview_frame = ttk.Frame(self.main_container)
+
+        self.vertical_pane = ttk.PanedWindow(self.main_container, orient=tk.VERTICAL)
+        self.vertical_pane.pack(fill=tk.BOTH, expand=True)
+
+        self.top_pane = ttk.PanedWindow(self.vertical_pane, orient=tk.HORIZONTAL)
+        self.vertical_pane.add(self.top_pane, weight=4)
+        bottom_pane_container = ttk.Frame(self.vertical_pane)
+        self.vertical_pane.add(bottom_pane_container, weight=2)
+
         self._create_tree_pane()
         self._create_selection_pane()
         self._create_bottom_notebook(bottom_pane_container)
 
-        bottom_controls_frame = ttk.Frame(self.main_container)
-        bottom_controls_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=(10, 0))
         self.btn_toggle_preview = ttk.Button(bottom_controls_frame, text="Show Preview", command=self.toggle_preview)
         self.btn_toggle_preview.pack(side=tk.LEFT)
-        
+
         self.btn_copy = ttk.Button(bottom_controls_frame, text="Copy to Clipboard", command=self.copy_to_clipboard, style='Accent.TButton')
         self.btn_copy.pack(side=tk.RIGHT)
-        
+
         # New label for "Copied!" notification - packed to the RIGHT (so it appears left of the copy button)
         self.copied_label = ttk.Label(bottom_controls_frame, text="", foreground="#4CAF50", font=("Segoe UI", 10, "bold"))
         self.copied_label.pack(side=tk.RIGHT, padx=(0, 10))
 
-        self.preview_frame = ttk.Frame(self.main_container)
         self._create_preview_widgets()
 
     def _create_tree_pane(self, *args):
@@ -451,12 +564,20 @@ class FileCopierApp:
         ttk.Button(preset_frame, text="Save As...", command=self.save_current_as_preset, width=10).pack(side=tk.LEFT)
         ttk.Button(preset_frame, text="Remove", command=self.remove_selected_preset, width=8).pack(side=tk.LEFT, padx=5)
         ttk.Label(selection_frame, text="Selected Files (Drag to Reorder)", font=("Segoe UI", 10, "bold")).pack(pady=(0, 5), anchor='w')
-        
+
+        # Create controls frame first to ensure it reserves space at the bottom
+        controls_frame = ttk.Frame(selection_frame)
+        controls_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=5)
+        ttk.Button(controls_frame, text="Remove Selected", command=self.remove_selected).pack(side=tk.LEFT)
+        ttk.Button(controls_frame, text="Clear All", command=self.clear_all).pack(side=tk.LEFT, padx=5)
+        self.selected_count_var = tk.StringVar(value="0 files selected")
+        ttk.Label(controls_frame, textvariable=self.selected_count_var).pack(side=tk.RIGHT)
+
         selection_tree_frame = ttk.Frame(selection_frame)
-        selection_tree_frame.pack(fill=tk.BOTH, expand=True)
+        selection_tree_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
         selection_tree_frame.grid_rowconfigure(0, weight=1)
         selection_tree_frame.grid_columnconfigure(0, weight=1)
-        
+
         self.selected_files_tree = ttk.Treeview(selection_tree_frame, columns=("filepath", "filetype", "filesize", "char_count", "changed"), show="headings", selectmode="extended")
         self.selected_files_tree.heading("filepath", text="File Path")
         self.selected_files_tree.heading("filetype", text="Type", anchor='center')
@@ -480,12 +601,7 @@ class FileCopierApp:
         # Set focus to enable keyboard shortcuts
         self.selected_files_tree.focus_set()
 
-        controls_frame = ttk.Frame(selection_frame)
-        controls_frame.pack(fill=tk.X, pady=5)
-        ttk.Button(controls_frame, text="Remove Selected", command=self.remove_selected).pack(side=tk.LEFT)
-        ttk.Button(controls_frame, text="Clear All", command=self.clear_all).pack(side=tk.LEFT, padx=5)
-        self.selected_count_var = tk.StringVar(value="0 files selected")
-        ttk.Label(controls_frame, textvariable=self.selected_count_var).pack(side=tk.RIGHT)
+        # Controls moved to top of function to ensure visibility
         self.top_pane.add(selection_frame, weight=3)
 
     def _create_bottom_notebook(self, parent):
@@ -500,6 +616,9 @@ class FileCopierApp:
         connections_tab = ttk.Frame(notebook, padding=5)
         notebook.add(connections_tab, text="Connections")
         self._create_connections_pane(connections_tab)
+        agentic_search_tab = ttk.Frame(notebook, padding=5)
+        notebook.add(agentic_search_tab, text="Agentic Search")
+        self._create_agentic_search_pane(agentic_search_tab)
 
     def _create_tools_pane(self, parent):
         tools_container = ttk.Frame(parent)
@@ -509,22 +628,44 @@ class FileCopierApp:
         smart_paster_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 5))
 
         ttk.Label(smart_paster_frame, text="Filepath Extractor", font=("Segoe UI", 10, "bold")).pack(anchor='w')
-        self.smart_paste_text = scrolledtext.ScrolledText(smart_paster_frame, height=4, wrap=tk.WORD, bg=DARK_ENTRY_BG, fg=DARK_FG, insertbackground=DARK_FG, font=("Segoe UI", 10), borderwidth=0, highlightthickness=1)
-        self.smart_paste_text.pack(fill=tk.BOTH, expand=True, pady=5)
+
+        # Pack controls at bottom first
         smart_paster_controls = ttk.Frame(smart_paster_frame)
-        smart_paster_controls.pack(fill=tk.X)
+        smart_paster_controls.pack(side=tk.BOTTOM, fill=tk.X, pady=(0, 5))
         ttk.Button(smart_paster_controls, text="Find & Select Files", command=self._initiate_smart_paste, style='Accent.TButton').pack(side=tk.LEFT)
+
+        self.smart_paste_text = scrolledtext.ScrolledText(smart_paster_frame, height=4, wrap=tk.WORD, bg=DARK_ENTRY_BG, fg=DARK_FG, insertbackground=DARK_FG, font=("Segoe UI", 10), borderwidth=0, highlightthickness=1)
+        self.smart_paste_text.pack(side=tk.TOP, fill=tk.BOTH, expand=True, pady=5)
 
         apply_changes_frame = ttk.Frame(tools_container)
         apply_changes_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(5, 0))
-        
+
         ttk.Label(apply_changes_frame, text="Apply Changes to Files", font=("Segoe UI", 10, "bold")).pack(anchor='w')
-        self.apply_changes_text = scrolledtext.ScrolledText(apply_changes_frame, height=4, wrap=tk.WORD, bg=DARK_ENTRY_BG, fg=DARK_FG, insertbackground=DARK_FG, font=("Segoe UI", 10), borderwidth=0, highlightthickness=1)
-        self.apply_changes_text.pack(fill=tk.BOTH, expand=True, pady=5)
+
+        # Pack controls at bottom first
         apply_changes_controls = ttk.Frame(apply_changes_frame)
-        apply_changes_controls.pack(fill=tk.X)
+        apply_changes_controls.pack(side=tk.BOTTOM, fill=tk.X, pady=(0, 5))
         ttk.Button(apply_changes_controls, text="Preview Changes", command=self._initiate_preview_changes).pack(side=tk.LEFT)
         ttk.Button(apply_changes_controls, text="Apply to Files", command=self._initiate_apply_changes, style='Accent.TButton').pack(side=tk.LEFT, padx=(5, 0))
+
+        self.apply_changes_text = scrolledtext.ScrolledText(apply_changes_frame, height=4, wrap=tk.WORD, bg=DARK_ENTRY_BG, fg=DARK_FG, insertbackground=DARK_FG, font=("Segoe UI", 10), borderwidth=0, highlightthickness=1)
+        self.apply_changes_text.pack(side=tk.TOP, fill=tk.BOTH, expand=True, pady=5)
+
+        # Undo/Redo buttons
+        self.btn_undo = ttk.Button(apply_changes_controls, text="Undo", command=self._initiate_undo, width=8)
+        self.btn_undo.pack(side=tk.LEFT, padx=(10, 0))
+        self.btn_undo.state(['disabled'])
+
+        self.btn_redo = ttk.Button(apply_changes_controls, text="Redo", command=self._initiate_redo, width=8)
+        self.btn_redo.pack(side=tk.LEFT, padx=(5, 0))
+        self.btn_redo.state(['disabled'])
+
+        # History label showing position
+        self.history_label = ttk.Label(apply_changes_controls, text="", font=("Segoe UI", 9))
+        self.history_label.pack(side=tk.LEFT, padx=(10, 0))
+
+        self.apply_status_label = ttk.Label(apply_changes_controls, text="", foreground="#4CAF50", font=("Segoe UI", 10, "bold"))
+        self.apply_status_label.pack(side=tk.LEFT, padx=(10, 0))
 
     def _create_log_pane(self, parent):
         ttk.Label(parent, text="Global Log", font=("Segoe UI", 10, "bold")).pack(anchor='w', pady=(5, 2))
@@ -544,34 +685,36 @@ class FileCopierApp:
         status_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 5))
         
         ttk.Label(status_frame, text="WebSocket Server Status", font=("Segoe UI", 10, "bold")).pack(anchor='w', pady=(0, 5))
-        
+
+        # Pack controls at bottom first
+        controls_frame = ttk.Frame(status_frame)
+        controls_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=(0, 10))
+
+        self.btn_toggle_server = ttk.Button(controls_frame, text="Disable Server", command=self.toggle_websocket_server)
+        self.btn_toggle_server.pack(side=tk.LEFT, padx=(0, 5))
+
+        self.btn_restart_server = ttk.Button(controls_frame, text="Restart Server", command=self.restart_websocket_server)
+        self.btn_restart_server.pack(side=tk.LEFT, padx=(0, 5))
+
+        self.btn_disconnect_all = ttk.Button(controls_frame, text="Disconnect All", command=self.disconnect_all_clients)
+        self.btn_disconnect_all.pack(side=tk.LEFT)
+
+        # Pack info frame in remaining space
         status_info_frame = ttk.Frame(status_frame)
-        status_info_frame.pack(fill=tk.X, pady=(0, 10))
-        
+        status_info_frame.pack(side=tk.TOP, fill=tk.X, pady=(0, 10))
+
         self.server_status_var = tk.StringVar(value="Stopped")
         self.server_port_var = tk.StringVar(value=f"Port: {WEBSOCKET_PORT}")
         self.server_uptime_var = tk.StringVar(value="Uptime: --")
         self.client_count_var = tk.StringVar(value="Connected: 0")
-        
+
         ttk.Label(status_info_frame, text="Status:").grid(row=0, column=0, sticky='w')
         self.status_label = ttk.Label(status_info_frame, textvariable=self.server_status_var, foreground="#F44336")
         self.status_label.grid(row=0, column=1, sticky='w', padx=(5, 0))
-        
+
         ttk.Label(status_info_frame, textvariable=self.server_port_var).grid(row=1, column=0, columnspan=2, sticky='w')
         ttk.Label(status_info_frame, textvariable=self.server_uptime_var).grid(row=2, column=0, columnspan=2, sticky='w')
         ttk.Label(status_info_frame, textvariable=self.client_count_var).grid(row=3, column=0, columnspan=2, sticky='w')
-        
-        controls_frame = ttk.Frame(status_frame)
-        controls_frame.pack(fill=tk.X, pady=(0, 10))
-        
-        self.btn_toggle_server = ttk.Button(controls_frame, text="Disable Server", command=self.toggle_websocket_server)
-        self.btn_toggle_server.pack(side=tk.LEFT, padx=(0, 5))
-        
-        self.btn_restart_server = ttk.Button(controls_frame, text="Restart Server", command=self.restart_websocket_server)
-        self.btn_restart_server.pack(side=tk.LEFT, padx=(0, 5))
-        
-        self.btn_disconnect_all = ttk.Button(controls_frame, text="Disconnect All", command=self.disconnect_all_clients)
-        self.btn_disconnect_all.pack(side=tk.LEFT)
         
         clients_frame = ttk.Frame(connections_container)
         clients_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(5, 0))
@@ -590,7 +733,570 @@ class FileCopierApp:
         clients_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         
         self._refresh_connections_display()
-        
+
+    def _create_agentic_search_pane(self, parent):
+        """Create the Agentic Search chat interface tab."""
+        main_container = ttk.Frame(parent)
+        main_container.pack(fill=tk.BOTH, expand=True)
+
+        # === HEADER TOOLBAR ===
+        self._create_agentic_header(main_container)
+
+        # === CHAT DISPLAY AREA ===
+        self._create_chat_display(main_container)
+
+        # === INPUT AREA ===
+        self._create_chat_input(main_container)
+
+        # Initialize Ollama client and refresh models
+        self.ollama_client = OllamaClient()
+        self.root.after(500, self._refresh_ollama_models)
+
+    def _create_agentic_header(self, parent):
+        """Create header with model selector and tool checkboxes."""
+        header_frame = ttk.Frame(parent)
+        header_frame.pack(fill=tk.X, pady=(0, 5))
+
+        # Model selector
+        ttk.Label(header_frame, text="Model:").pack(side=tk.LEFT)
+        self.ollama_model_var = tk.StringVar()
+        self.ollama_model_combo = ttk.Combobox(
+            header_frame,
+            textvariable=self.ollama_model_var,
+            state="readonly",
+            width=25
+        )
+        self.ollama_model_combo.pack(side=tk.LEFT, padx=(5, 10))
+
+        # Refresh models button
+        ttk.Button(header_frame, text="Refresh", command=self._refresh_ollama_models).pack(side=tk.LEFT, padx=(0, 15))
+
+        # Tool checkboxes frame with scrollable area
+        tools_label = ttk.Label(header_frame, text="Tools:")
+        tools_label.pack(side=tk.LEFT)
+
+        self.tool_checkboxes_frame = ttk.Frame(header_frame)
+        self.tool_checkboxes_frame.pack(side=tk.LEFT, padx=5)
+
+        # Populate tool checkboxes
+        self._populate_tool_checkboxes()
+
+        # Ollama status indicator
+        self.ollama_status_var = tk.StringVar(value="Checking...")
+        self.ollama_status_label = ttk.Label(header_frame, textvariable=self.ollama_status_var, foreground="#FFC107")
+        self.ollama_status_label.pack(side=tk.RIGHT)
+
+    def _populate_tool_checkboxes(self):
+        """Populate checkboxes for available agent tools."""
+        for widget in self.tool_checkboxes_frame.winfo_children():
+            widget.destroy()
+
+        self.tool_vars.clear()
+        for tool in sorted(self._agent_tools):
+            var = tk.BooleanVar(value=True)  # All enabled by default
+            self.tool_vars[tool] = var
+            cb = ttk.Checkbutton(self.tool_checkboxes_frame, text=tool, variable=var)
+            cb.pack(side=tk.LEFT, padx=2)
+
+    def _create_chat_display(self, parent):
+        """Create scrollable chat display with bubble messages."""
+        chat_container = ttk.Frame(parent)
+        chat_container.pack(fill=tk.BOTH, expand=True, pady=5)
+
+        # Use Canvas with scrollbar for custom bubble rendering
+        self.chat_canvas = tk.Canvas(
+            chat_container,
+            bg=DARK_BG,
+            highlightthickness=0
+        )
+        chat_scrollbar = ttk.Scrollbar(chat_container, orient="vertical", command=self.chat_canvas.yview)
+
+        self.chat_inner_frame = ttk.Frame(self.chat_canvas)
+        self.chat_canvas_window = self.chat_canvas.create_window((0, 0), window=self.chat_inner_frame, anchor="nw", tags="inner")
+
+        self.chat_canvas.configure(yscrollcommand=chat_scrollbar.set)
+
+        chat_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.chat_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        # Bind resize events
+        self.chat_inner_frame.bind("<Configure>", self._on_chat_frame_configure)
+        self.chat_canvas.bind("<Configure>", self._on_chat_canvas_configure)
+
+        # Bind mousewheel for scrolling
+        self.chat_canvas.bind("<MouseWheel>", self._on_chat_mousewheel)
+        self.chat_canvas.bind("<Button-4>", self._on_chat_mousewheel)
+        self.chat_canvas.bind("<Button-5>", self._on_chat_mousewheel)
+
+    def _on_chat_frame_configure(self, event):
+        """Update scroll region when inner frame changes size."""
+        self.chat_canvas.configure(scrollregion=self.chat_canvas.bbox("all"))
+
+    def _on_chat_canvas_configure(self, event):
+        """Update inner frame width when canvas resizes."""
+        self.chat_canvas.itemconfig(self.chat_canvas_window, width=event.width)
+
+    def _on_chat_mousewheel(self, event):
+        """Handle mouse wheel scrolling in chat."""
+        if event.num == 4 or event.delta > 0:
+            self.chat_canvas.yview_scroll(-1, "units")
+        elif event.num == 5 or event.delta < 0:
+            self.chat_canvas.yview_scroll(1, "units")
+
+    def _create_chat_input(self, parent):
+        """Create input text area with Send button."""
+        input_frame = ttk.Frame(parent)
+        input_frame.pack(fill=tk.X, pady=(5, 0))
+
+        # Multi-line input with ScrolledText
+        self.chat_input = scrolledtext.ScrolledText(
+            input_frame,
+            height=3,
+            wrap=tk.WORD,
+            bg=DARK_ENTRY_BG,
+            fg=DARK_FG,
+            insertbackground=DARK_FG,
+            font=("Segoe UI", 10),
+            borderwidth=0,
+            highlightthickness=1
+        )
+        self.chat_input.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        # Bind Enter for send (Shift+Enter for newline)
+        self.chat_input.bind("<Return>", self._on_chat_enter)
+        self.chat_input.bind("<Shift-Return>", lambda e: None)  # Allow newline
+
+        # Button container
+        btn_frame = ttk.Frame(input_frame)
+        btn_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=(5, 0))
+
+        # Send/Stop button
+        self.btn_send_chat = ttk.Button(
+            btn_frame,
+            text="Send",
+            command=self._on_send_stop_click,
+            style='Accent.TButton'
+        )
+        self.btn_send_chat.pack(side=tk.TOP, pady=(0, 2))
+
+        # Clear chat button
+        ttk.Button(btn_frame, text="Clear", command=self._clear_chat).pack(side=tk.TOP)
+
+    def _on_chat_enter(self, event):
+        """Handle Enter key in chat input."""
+        if not event.state & 0x1:  # Not Shift+Enter
+            self._send_chat_message()
+            return "break"  # Prevent newline
+        return None
+
+    def _add_chat_bubble(self, message: ChatMessage, is_streaming: bool = False) -> Optional[tk.Text]:
+        """Add a styled message bubble to the chat display."""
+        is_user = message.role == MessageRole.USER
+
+        # Container frame for alignment
+        bubble_container = ttk.Frame(self.chat_inner_frame)
+        bubble_container.pack(fill=tk.X, pady=2, padx=5)
+
+        # Bubble frame with background
+        bubble_frame = tk.Frame(
+            bubble_container,
+            bg=BUBBLE_USER_BG if is_user else BUBBLE_AGENT_BG,
+            padx=10,
+            pady=5
+        )
+
+        # Align right for user, left for agent
+        bubble_frame.pack(
+            side=tk.RIGHT if is_user else tk.LEFT,
+            anchor='e' if is_user else 'w'
+        )
+
+        # Timestamp label
+        time_str = message.timestamp.strftime("%H:%M")
+        role_label = "You" if is_user else "Agent"
+        tk.Label(
+            bubble_frame,
+            text=f"{role_label} - {time_str}",
+            bg=BUBBLE_USER_BG if is_user else BUBBLE_AGENT_BG,
+            fg="#aaaaaa",
+            font=("Segoe UI", 8)
+        ).pack(anchor='w')
+
+        # Message text (using tk.Text for word wrap)
+        msg_text = tk.Text(
+            bubble_frame,
+            wrap=tk.WORD,
+            width=60,  # Max width in characters
+            height=1,  # Will auto-adjust
+            bg=BUBBLE_USER_BG if is_user else BUBBLE_AGENT_BG,
+            fg=BUBBLE_USER_FG if is_user else BUBBLE_AGENT_FG,
+            font=("Segoe UI", 10),
+            borderwidth=0,
+            highlightthickness=0,
+            relief=tk.FLAT
+        )
+        msg_text.insert("1.0", message.content)
+
+        # Auto-adjust height based on content
+        line_count = int(msg_text.index('end-1c').split('.')[0])
+        msg_text.config(height=min(max(line_count, 1), 20))
+
+        if not is_streaming:
+            msg_text.config(state=tk.DISABLED)
+
+        msg_text.pack()
+
+        # Scroll to bottom
+        self.chat_canvas.update_idletasks()
+        self.chat_canvas.yview_moveto(1.0)
+
+        return msg_text if is_streaming else None
+
+    def _update_streaming_bubble(self, text_widget: tk.Text, content: str):
+        """Update a streaming bubble with new content."""
+        text_widget.config(state=tk.NORMAL)
+        text_widget.delete("1.0", tk.END)
+        text_widget.insert("1.0", content)
+
+        # Auto-adjust height
+        line_count = int(text_widget.index('end-1c').split('.')[0])
+        text_widget.config(height=min(max(line_count, 1), 20))
+
+        # Scroll to bottom
+        self.chat_canvas.update_idletasks()
+        self.chat_canvas.yview_moveto(1.0)
+
+    def _finalize_streaming_bubble(self, text_widget: tk.Text):
+        """Finalize a streaming bubble (make it read-only)."""
+        text_widget.config(state=tk.DISABLED)
+
+    def _clear_chat(self):
+        """Clear all chat messages."""
+        self._stop_waiting_animation()
+        self.current_streaming_bubble = None
+        self.chat_history.clear()
+        for widget in self.chat_inner_frame.winfo_children():
+            widget.destroy()
+        self._log_message("Chat cleared.", "info")
+
+    # === Ollama Integration Methods ===
+
+    def _refresh_ollama_models(self):
+        """Fetch available models from Ollama API."""
+        def worker():
+            try:
+                if self.ollama_client:
+                    models = self.ollama_client.list_models()
+                    self.root.after(0, lambda: self._update_model_list(models))
+            except Exception as e:
+                self.root.after(0, lambda: self._set_ollama_status("Offline", "#F44336"))
+                self._log_message(f"Ollama connection error: {e}", "error")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _update_model_list(self, models: List[str]):
+        """Update model dropdown with available models."""
+        self.ollama_model_combo['values'] = models
+        if models:
+            self.ollama_model_combo.current(0)
+            self._set_ollama_status("Connected", "#4CAF50")
+            self._log_message(f"Ollama connected. {len(models)} model(s) available.", "success")
+        else:
+            self._set_ollama_status("No models", "#FFC107")
+
+    def _set_ollama_status(self, text: str, color: str):
+        """Update Ollama status indicator."""
+        if self.ollama_status_var:
+            self.ollama_status_var.set(text)
+        if hasattr(self, 'ollama_status_label'):
+            self.ollama_status_label.config(foreground=color)
+
+    def _on_send_stop_click(self):
+        """Handle Send/Stop button click."""
+        if self._generation_in_progress:
+            self._stop_generation_request()
+        else:
+            self._send_chat_message()
+
+    def _stop_generation_request(self):
+        """Request to stop the current generation."""
+        self._stop_generation = True
+        self._log_message("Stopping generation...", "info")
+
+    def _set_generation_state(self, in_progress: bool):
+        """Update UI to reflect generation state."""
+        self._generation_in_progress = in_progress
+        if in_progress:
+            self.btn_send_chat.config(text="Stop", style='Danger.TButton')
+            self._stop_generation = False
+        else:
+            self.btn_send_chat.config(text="Send", style='Accent.TButton')
+            self._stop_generation = False
+
+    def _send_chat_message(self):
+        """Send user message and get agent response."""
+        content = self.chat_input.get("1.0", tk.END).strip()
+        if not content:
+            return
+
+        # Clear input
+        self.chat_input.delete("1.0", tk.END)
+
+        # Add user message
+        user_msg = ChatMessage(role=MessageRole.USER, content=content)
+        self.chat_history.append(user_msg)
+        self._add_chat_bubble(user_msg)
+
+        # Switch to Stop button
+        self._set_generation_state(True)
+
+        # Start async response
+        threading.Thread(target=self._get_agent_response, daemon=True).start()
+
+    def _get_agent_response(self):
+        """Worker thread for getting streaming response from Ollama."""
+        model = self.ollama_model_var.get() if self.ollama_model_var else None
+        if not model:
+            self.root.after(0, lambda: self._log_message("No model selected", "error"))
+            self.root.after(0, lambda: self._set_generation_state(False))
+            return
+
+        # Build messages for API
+        messages = [msg.to_dict() for msg in self.chat_history]
+
+        # Add system prompt with enabled tools
+        enabled_tools = [t for t, var in self.tool_vars.items() if var.get()]
+        system_prompt = self._build_system_prompt(enabled_tools)
+        messages.insert(0, {"role": "system", "content": system_prompt})
+
+        try:
+            # Create placeholder bubble for streaming
+            placeholder_msg = ChatMessage(role=MessageRole.ASSISTANT, content="...")
+            self.root.after(0, lambda: self._create_streaming_bubble(placeholder_msg))
+
+            # Small delay to ensure bubble is created
+            import time
+            time.sleep(0.1)
+
+            # Stream response
+            full_response = ""
+            stopped = False
+            for chunk in self.ollama_client.chat_stream(model, messages):
+                # Check for stop request
+                if self._stop_generation:
+                    stopped = True
+                    full_response += "\n\n[Generation stopped by user]"
+                    break
+                full_response += chunk
+                # Update UI progressively
+                self.root.after(0, lambda r=full_response: self._update_current_streaming(r))
+
+            # Finalize response
+            if stopped:
+                self.root.after(0, lambda r=full_response: self._finalize_stopped_response(r))
+            else:
+                self.root.after(0, lambda: self._finalize_response(full_response))
+
+        except Exception as e:
+            self.root.after(0, lambda: self._log_message(f"Ollama error: {e}", "error"))
+            self.root.after(0, lambda: self._handle_streaming_error(str(e)))
+        finally:
+            self.root.after(0, lambda: self._set_generation_state(False))
+
+    def _create_streaming_bubble(self, message: ChatMessage):
+        """Create a bubble for streaming response."""
+        self.current_streaming_bubble = self._add_chat_bubble(message, is_streaming=True)
+        # Start waiting animation
+        self._start_waiting_animation()
+
+    def _start_waiting_animation(self):
+        """Start the waiting dots animation."""
+        self._waiting_animation_state = 0
+        self._animate_waiting_dots()
+
+    def _animate_waiting_dots(self):
+        """Animate the waiting dots in the streaming bubble."""
+        if self.current_streaming_bubble is None:
+            return
+
+        # Check if we're still in "waiting" state (content is just dots)
+        try:
+            current_content = self.current_streaming_bubble.get("1.0", tk.END).strip()
+            # Only animate if content is still the placeholder dots
+            if current_content in ("...", "..", ".", ""):
+                dots = [".", "..", "..."]
+                self._waiting_animation_state = (self._waiting_animation_state + 1) % len(dots)
+                self._update_streaming_bubble(self.current_streaming_bubble, dots[self._waiting_animation_state])
+                # Schedule next animation frame
+                self._waiting_animation_job = self.root.after(400, self._animate_waiting_dots)
+            else:
+                # Real content arrived, stop animation
+                self._stop_waiting_animation()
+        except tk.TclError:
+            # Widget destroyed
+            self._stop_waiting_animation()
+
+    def _stop_waiting_animation(self):
+        """Stop the waiting dots animation."""
+        if self._waiting_animation_job:
+            self.root.after_cancel(self._waiting_animation_job)
+            self._waiting_animation_job = None
+
+    def _update_current_streaming(self, content: str):
+        """Update the current streaming bubble."""
+        # Stop animation when real content arrives
+        self._stop_waiting_animation()
+        if self.current_streaming_bubble:
+            self._update_streaming_bubble(self.current_streaming_bubble, content)
+
+    def _handle_streaming_error(self, error_msg: str):
+        """Handle error during streaming."""
+        self._stop_waiting_animation()
+        if self.current_streaming_bubble:
+            self._update_streaming_bubble(self.current_streaming_bubble, f"Error: {error_msg}")
+            self._finalize_streaming_bubble(self.current_streaming_bubble)
+        self.current_streaming_bubble = None
+
+    def _build_system_prompt(self, enabled_tools: List[str]) -> str:
+        """Build system prompt with file extraction instructions."""
+        tool_list = ", ".join(enabled_tools) if enabled_tools else "none"
+
+        return f"""You are an AI assistant helping users explore and navigate a codebase.
+
+AVAILABLE TOOLS: {tool_list}
+
+IMPORTANT: When you identify files that are relevant to the user's query, you MUST include them in your response using this exact format:
+[FILES: path/to/file1.py, path/to/file2.js, path/to/file3.txt]
+
+This format allows the GUI to automatically select these files for the user.
+
+Guidelines:
+- Use relative paths from the project root
+- Separate multiple files with commas
+- Place the [FILES: ...] tag at the end of your response
+- Only include files that actually exist and are directly relevant
+- Be concise and helpful in your explanations
+
+Working directory: {self.directory}
+"""
+
+    def _extract_files_from_response(self, response: str) -> List[str]:
+        """Parse [FILES: path1, path2, ...] from agent response."""
+        matches = FILE_EXTRACTION_PATTERN.findall(response)
+        files = []
+        for match in matches:
+            paths = [p.strip() for p in match.split(',')]
+            files.extend(paths)
+        return files
+
+    def _finalize_response(self, response: str):
+        """Complete the agent response and process extracted files."""
+        # Extract files from response
+        extracted_files = self._extract_files_from_response(response)
+
+        # Create and store message
+        agent_msg = ChatMessage(
+            role=MessageRole.ASSISTANT,
+            content=response,
+            extracted_files=extracted_files
+        )
+        self.chat_history.append(agent_msg)
+
+        # Finalize the streaming bubble
+        if self.current_streaming_bubble:
+            self._finalize_streaming_bubble(self.current_streaming_bubble)
+        self.current_streaming_bubble = None
+
+        # Auto-add extracted files to selection
+        if extracted_files:
+            self._auto_select_extracted_files(extracted_files)
+
+    def _finalize_stopped_response(self, response: str):
+        """Finalize a response that was stopped by the user."""
+        # Still extract any files that were mentioned before stopping
+        extracted_files = self._extract_files_from_response(response)
+
+        # Create and store message (partial response)
+        agent_msg = ChatMessage(
+            role=MessageRole.ASSISTANT,
+            content=response,
+            extracted_files=extracted_files
+        )
+        self.chat_history.append(agent_msg)
+
+        # Update and finalize the streaming bubble
+        if self.current_streaming_bubble:
+            self._update_streaming_bubble(self.current_streaming_bubble, response)
+            self._finalize_streaming_bubble(self.current_streaming_bubble)
+        self.current_streaming_bubble = None
+
+        self._log_message("Generation stopped.", "info")
+
+        # Still auto-add any extracted files
+        if extracted_files:
+            self._auto_select_extracted_files(extracted_files)
+
+    def _auto_select_extracted_files(self, file_paths: List[str]):
+        """Add extracted files to the file selection panel."""
+        added_count = 0
+        for rel_path in file_paths:
+            # Normalize path
+            rel_path = rel_path.strip().replace('\\', '/')
+            abs_path = os.path.join(self.directory, os.path.normpath(rel_path))
+            if os.path.exists(abs_path):
+                if self._add_file_to_selection(rel_path):
+                    added_count += 1
+
+        if added_count > 0:
+            self._update_ui_state()
+            self._log_message(f"Agent suggested {added_count} file(s) - added to selection", "success")
+        elif file_paths:
+            self._log_message(f"Agent suggested {len(file_paths)} file(s) but none were found", "warning")
+
+    # === WebSocket Message Injection ===
+
+    def _inject_external_query(self, query: str):
+        """Inject a query from external WebSocket client into the chat."""
+        if not query.strip():
+            return
+
+        # Don't inject if already generating
+        if self._generation_in_progress:
+            self._log_message("Cannot inject query while generation in progress", "warning")
+            return
+
+        # Add as user message
+        user_msg = ChatMessage(role=MessageRole.USER, content=query)
+        self.chat_history.append(user_msg)
+        self._add_chat_bubble(user_msg)
+
+        # Switch to Stop button and get response
+        self._set_generation_state(True)
+        threading.Thread(target=self._get_agent_response, daemon=True).start()
+
+        self._log_message(f"Received external query via WebSocket", "info")
+
+    def _inject_external_response(self, response: str):
+        """Inject a response from external WebSocket client into the chat."""
+        if not response.strip():
+            return
+
+        # Extract files and create message
+        extracted_files = self._extract_files_from_response(response)
+        agent_msg = ChatMessage(
+            role=MessageRole.ASSISTANT,
+            content=response,
+            extracted_files=extracted_files
+        )
+        self.chat_history.append(agent_msg)
+        self._add_chat_bubble(agent_msg)
+
+        # Auto-select extracted files
+        if extracted_files:
+            self._auto_select_extracted_files(extracted_files)
+
+        self._log_message(f"Received external response via WebSocket", "info")
+
     def _create_preview_widgets(self):
         preview_header_frame = ttk.Frame(self.preview_frame)
         preview_header_frame.pack(fill=tk.X, pady=(5, 0))
@@ -643,7 +1349,13 @@ class FileCopierApp:
         threading.Thread(target=self._apply_changes_worker, args=(content,), daemon=True).start()
 
     def _apply_changes_worker(self, content: str):
-        results = apply_changes_to_files(content, self.directory)
+        results, operation = apply_changes_with_history(content, self.directory)
+
+        # Add to history if operation was created
+        if operation:
+            self.apply_history.add_operation(operation)
+            self.root.after(0, self._update_history_buttons)
+
         for file_path in results["success"]:
             self._log_message(f"  ✓ Applied changes to {file_path}", 'success')
         for error_msg in results["errors"]:
@@ -651,6 +1363,11 @@ class FileCopierApp:
         summary = f"Apply Changes: Finished. {len(results['success'])} success, {len(results['errors'])} errors."
         self._log_message(summary, 'error' if results['errors'] else 'success')
         if results['success']:
+            # Show success status in the label
+            status_text = f"Applied! Written: {len(results['success'])} files | {results.get('total_chars', 0)} chars"
+            self.root.after(0, lambda: self.apply_status_label.config(text=status_text))
+            # Hide the label after 5 seconds
+            self.root.after(5000, lambda: self.apply_status_label.config(text=""))
             self.root.after(0, self._perform_filter)
 
     def _initiate_preview_changes(self):
@@ -686,7 +1403,13 @@ class FileCopierApp:
 
     def _apply_selected_changes_worker(self, changes: List[FileChange]):
         """Apply the selected changes in a worker thread."""
-        results = apply_selected_changes(changes)
+        results, operation = apply_selected_with_history(changes)
+
+        # Add to history if operation was created
+        if operation:
+            self.apply_history.add_operation(operation)
+            self.root.after(0, self._update_history_buttons)
+
         for file_path in results["success"]:
             self._log_message(f"  ✓ Applied changes to {file_path}", 'success')
         for error_msg in results["errors"]:
@@ -695,6 +1418,118 @@ class FileCopierApp:
         self._log_message(summary, 'error' if results['errors'] else 'success')
         if results['success']:
             self.root.after(0, self._perform_filter)
+
+    def _update_history_buttons(self):
+        """Update the enabled/disabled state of undo/redo buttons."""
+        can_undo = self.apply_history.can_undo(self.directory)
+        can_redo = self.apply_history.can_redo(self.directory)
+
+        if can_undo:
+            self.btn_undo.state(['!disabled'])
+        else:
+            self.btn_undo.state(['disabled'])
+
+        if can_redo:
+            self.btn_redo.state(['!disabled'])
+        else:
+            self.btn_redo.state(['disabled'])
+
+        # Update history label
+        history = self.apply_history.get_history(self.directory)
+        pos = self.apply_history.get_position(self.directory)
+        if history:
+            self.history_label.config(text=f"History: {pos + 1}/{len(history)}")
+        else:
+            self.history_label.config(text="")
+
+    def _initiate_undo(self):
+        """Start the undo operation."""
+        operation = self.apply_history.get_undo_operation(self.directory)
+        if not operation:
+            return
+
+        # Validate current state matches what we expect (after_snapshots)
+        validation = validate_file_state(operation.after_snapshots)
+
+        if not validation.is_valid:
+            # Show warning dialog
+            msg = "Files have been modified since the last apply:\n\n"
+            msg += "\n".join(f"  - {m}" for m in validation.mismatches[:5])
+            if len(validation.mismatches) > 5:
+                msg += f"\n  ... and {len(validation.mismatches) - 5} more"
+            msg += "\n\nUndo anyway? This will overwrite current changes."
+
+            if not messagebox.askyesno("State Mismatch Warning", msg, icon='warning'):
+                return
+
+        self._log_message(f"Undo: Reverting {len(operation.before_snapshots)} file(s)...")
+        threading.Thread(
+            target=self._undo_worker,
+            args=(operation,),
+            daemon=True
+        ).start()
+
+    def _undo_worker(self, operation: ApplyOperation):
+        """Worker thread for undo operation."""
+        results = apply_snapshots(operation.before_snapshots)
+
+        # Move history position backward
+        self.apply_history.move_backward(self.directory)
+
+        for file_path in results["success"]:
+            self._log_message(f"  ↩ Restored {file_path}", 'success')
+        for error_msg in results["errors"]:
+            self._log_message(f"  ✗ {error_msg}", 'error')
+
+        summary = f"Undo: Finished. {len(results['success'])} restored, {len(results['errors'])} errors."
+        self._log_message(summary, 'error' if results['errors'] else 'success')
+
+        self.root.after(0, self._update_history_buttons)
+        self.root.after(0, self._perform_filter)
+
+    def _initiate_redo(self):
+        """Start the redo operation."""
+        operation = self.apply_history.get_redo_operation(self.directory)
+        if not operation:
+            return
+
+        # Validate current state matches what we expect (before_snapshots)
+        validation = validate_file_state(operation.before_snapshots)
+
+        if not validation.is_valid:
+            msg = "Files have been modified since the undo:\n\n"
+            msg += "\n".join(f"  - {m}" for m in validation.mismatches[:5])
+            if len(validation.mismatches) > 5:
+                msg += f"\n  ... and {len(validation.mismatches) - 5} more"
+            msg += "\n\nRedo anyway? This will overwrite current changes."
+
+            if not messagebox.askyesno("State Mismatch Warning", msg, icon='warning'):
+                return
+
+        self._log_message(f"Redo: Re-applying {len(operation.after_snapshots)} file(s)...")
+        threading.Thread(
+            target=self._redo_worker,
+            args=(operation,),
+            daemon=True
+        ).start()
+
+    def _redo_worker(self, operation: ApplyOperation):
+        """Worker thread for redo operation."""
+        results = apply_snapshots(operation.after_snapshots)
+
+        # Move history position forward
+        self.apply_history.move_forward(self.directory)
+
+        for file_path in results["success"]:
+            self._log_message(f"  ↪ Re-applied {file_path}", 'success')
+        for error_msg in results["errors"]:
+            self._log_message(f"  ✗ {error_msg}", 'error')
+
+        summary = f"Redo: Finished. {len(results['success'])} re-applied, {len(results['errors'])} errors."
+        self._log_message(summary, 'error' if results['errors'] else 'success')
+
+        self.root.after(0, self._update_history_buttons)
+        self.root.after(0, self._perform_filter)
 
     def _initiate_smart_paste(self):
         content = self.smart_paste_text.get("1.0", tk.END).strip()
@@ -1200,7 +2035,7 @@ class FileCopierApp:
     def toggle_preview(self):
         self.preview_visible = not self.preview_visible
         if self.preview_visible:
-            self.preview_frame.pack(side=tk.BOTTOM, fill=tk.BOTH, expand=True, pady=(10, 0), in_=self.main_container)
+            self.preview_frame.pack(side=tk.BOTTOM, fill=tk.BOTH, expand=True, pady=(10, 0), in_=self.main_container, before=self.vertical_pane)
             self.update_preview()
         else:
             self.preview_frame.pack_forget()

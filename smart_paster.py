@@ -2,9 +2,10 @@
 import os
 import re
 from typing import List, Tuple, Optional, Dict, Set
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 import difflib
+from datetime import datetime
 import fitz  # PyMuPDF
 from odf import text, teletype
 from odf.opendocument import load as odf_load
@@ -67,6 +68,177 @@ class FileChange:
             return f"+{self.lines_added} -{self.lines_removed} lines"
         else:
             return "Invalid path"
+
+# --- History Management for Undo/Redo ---
+
+class FileState(Enum):
+    """Represents whether a file existed before/after an operation."""
+    EXISTS = "exists"
+    NOT_EXISTS = "not_exists"
+
+@dataclass
+class FileSnapshot:
+    """Captures the state of a single file at a point in time."""
+    file_path: str           # Relative path from root_directory
+    full_path: str           # Absolute path
+    content: Optional[str]   # File content (None if file didn't exist)
+    state: FileState         # Whether file existed
+
+    @classmethod
+    def capture(cls, full_path: str, file_path: str) -> 'FileSnapshot':
+        """Capture current state of a file."""
+        if os.path.exists(full_path):
+            with open(full_path, 'r', encoding='utf-8', errors='replace') as f:
+                content = f.read()
+            return cls(file_path, full_path, content, FileState.EXISTS)
+        return cls(file_path, full_path, None, FileState.NOT_EXISTS)
+
+@dataclass
+class ApplyOperation:
+    """Represents a single apply operation that can be undone/redone."""
+    timestamp: datetime
+    root_directory: str
+    before_snapshots: Dict[str, FileSnapshot]  # file_path -> snapshot before apply
+    after_snapshots: Dict[str, FileSnapshot]   # file_path -> snapshot after apply
+    description: str = ""  # e.g., "Applied 3 files"
+
+@dataclass
+class ValidationResult:
+    """Result of validating current file state against expected state."""
+    is_valid: bool
+    mismatches: List[str]  # List of human-readable mismatch descriptions
+
+class ApplyHistoryManager:
+    """Manages undo/redo history for apply operations, per directory."""
+
+    def __init__(self):
+        self._history: Dict[str, List[ApplyOperation]] = {}
+        self._position: Dict[str, int] = {}  # -1 means at latest
+
+    def get_history(self, directory: str) -> List[ApplyOperation]:
+        """Get history for a directory."""
+        return self._history.get(directory, [])
+
+    def get_position(self, directory: str) -> int:
+        """Get current position in history. Returns index of last applied operation."""
+        history = self.get_history(directory)
+        if not history:
+            return -1
+        pos = self._position.get(directory, len(history) - 1)
+        return min(pos, len(history) - 1)
+
+    def add_operation(self, operation: ApplyOperation):
+        """Add a new operation to history. Clears any 'future' operations."""
+        directory = operation.root_directory
+        if directory not in self._history:
+            self._history[directory] = []
+
+        # If we're not at the end, truncate future operations
+        current_pos = self.get_position(directory)
+        if current_pos >= 0 and current_pos < len(self._history[directory]) - 1:
+            self._history[directory] = self._history[directory][:current_pos + 1]
+
+        self._history[directory].append(operation)
+        self._position[directory] = len(self._history[directory]) - 1
+
+    def can_undo(self, directory: str) -> bool:
+        """Check if undo is available."""
+        return self.get_position(directory) >= 0
+
+    def can_redo(self, directory: str) -> bool:
+        """Check if redo is available."""
+        history = self.get_history(directory)
+        pos = self.get_position(directory)
+        return pos < len(history) - 1
+
+    def get_undo_operation(self, directory: str) -> Optional[ApplyOperation]:
+        """Get the operation that would be undone (without moving position)."""
+        if not self.can_undo(directory):
+            return None
+        pos = self.get_position(directory)
+        return self._history[directory][pos]
+
+    def get_redo_operation(self, directory: str) -> Optional[ApplyOperation]:
+        """Get the operation that would be redone (without moving position)."""
+        if not self.can_redo(directory):
+            return None
+        pos = self.get_position(directory)
+        return self._history[directory][pos + 1]
+
+    def move_backward(self, directory: str):
+        """Move position backward after successful undo."""
+        if self.can_undo(directory):
+            self._position[directory] = self.get_position(directory) - 1
+
+    def move_forward(self, directory: str):
+        """Move position forward after successful redo."""
+        if self.can_redo(directory):
+            self._position[directory] = self.get_position(directory) + 1
+
+def validate_file_state(expected_snapshots: Dict[str, FileSnapshot]) -> ValidationResult:
+    """
+    Validate that current file states match expected snapshots.
+    Uses character-level comparison.
+    """
+    mismatches = []
+
+    for file_path, expected in expected_snapshots.items():
+        current = FileSnapshot.capture(expected.full_path, file_path)
+
+        # Check existence state
+        if current.state != expected.state:
+            if expected.state == FileState.EXISTS:
+                mismatches.append(f"{file_path}: Expected to exist, but doesn't")
+            else:
+                mismatches.append(f"{file_path}: Expected to not exist, but does")
+            continue
+
+        # If both exist, compare content character-by-character
+        if current.state == FileState.EXISTS and expected.state == FileState.EXISTS:
+            if current.content != expected.content:
+                # Calculate diff summary
+                current_len = len(current.content) if current.content else 0
+                expected_len = len(expected.content) if expected.content else 0
+                mismatches.append(
+                    f"{file_path}: Content differs ({current_len} chars vs expected {expected_len} chars)"
+                )
+
+    return ValidationResult(
+        is_valid=len(mismatches) == 0,
+        mismatches=mismatches
+    )
+
+def apply_snapshots(snapshots: Dict[str, FileSnapshot]) -> Dict[str, List[str]]:
+    """
+    Apply a set of file snapshots to the filesystem.
+    Handles both restoring content and deleting files.
+    """
+    results: Dict[str, List[str]] = {"success": [], "errors": []}
+
+    for file_path, snapshot in snapshots.items():
+        try:
+            if snapshot.state == FileState.NOT_EXISTS:
+                # File should not exist - delete it if it does
+                if os.path.exists(snapshot.full_path):
+                    os.remove(snapshot.full_path)
+                    # Optionally clean up empty parent directories
+                    parent = os.path.dirname(snapshot.full_path)
+                    try:
+                        if parent and os.path.isdir(parent) and not os.listdir(parent):
+                            os.rmdir(parent)
+                    except OSError:
+                        pass  # Directory not empty or other issue
+                results["success"].append(f"{file_path} (deleted)")
+            else:
+                # File should exist with specific content
+                os.makedirs(os.path.dirname(snapshot.full_path), exist_ok=True)
+                with open(snapshot.full_path, 'w', encoding='utf-8') as f:
+                    f.write(snapshot.content)
+                results["success"].append(file_path)
+        except Exception as e:
+            results["errors"].append(f"Failed to restore {file_path}: {e}")
+
+    return results
 
 # --- All clipboard/request processing logic is now centralized here ---
 
@@ -487,6 +659,7 @@ def apply_selected_changes(changes: List[FileChange]) -> Dict[str, List[str]]:
 
 def apply_changes_to_files(content_to_apply: str, root_directory: str) -> Dict[str, List[str]]:
     results: Dict[str, List[str]] = {"success": [], "errors": []}
+    total_chars = 0
     # Pattern supports two formats:
     # Format 1 (backticks): ### 1. `path/to/file.ext`
     # Format 2 (simple): # path/to/file.ext
@@ -508,12 +681,108 @@ def apply_changes_to_files(content_to_apply: str, root_directory: str) -> Dict[s
             # if "base64" in content_to_apply.split(file_path,1)[1].split("```",1):
             #     with open(full_path, 'wb') as f: f.write(base64.b64decode(content.strip()))
             # else:
-            with open(full_path, 'w', encoding='utf-8') as f: f.write(content.strip() + '\n')
+            content_stripped = content.strip()
+            with open(full_path, 'w', encoding='utf-8') as f: f.write(content_stripped + '\n')
             results["success"].append(file_path)
+            total_chars += len(content_stripped)
         except Exception as e:
             results["errors"].append(f"Failed to write {file_path}: {e}")
     
     if not results["success"] and not results["errors"]:
         results["errors"].append("No valid file blocks found to apply.")
-        
+
+    results["total_chars"] = total_chars
     return results
+
+def apply_changes_with_history(
+    content_to_apply: str,
+    root_directory: str
+) -> Tuple[Dict[str, List[str]], Optional[ApplyOperation]]:
+    """
+    Apply changes and return both results and an ApplyOperation for history.
+    Returns (results_dict, operation_or_none)
+    """
+    # First, parse to get the list of files that will be affected
+    changes = preview_changes_to_files(content_to_apply, root_directory)
+
+    if not changes:
+        results = {"success": [], "errors": ["No valid file blocks found to apply."], "total_chars": 0}
+        return results, None
+
+    # Capture BEFORE snapshots for all files
+    before_snapshots = {}
+    for change in changes:
+        if change.change_type != ChangeType.INVALID_PATH:
+            snapshot = FileSnapshot.capture(change.full_path, change.file_path)
+            before_snapshots[change.file_path] = snapshot
+
+    # Apply the changes
+    results = apply_changes_to_files(content_to_apply, root_directory)
+
+    # Capture AFTER snapshots for successfully applied files
+    after_snapshots = {}
+    for file_path in results["success"]:
+        full_path = os.path.join(root_directory, file_path.replace('/', os.path.sep))
+        snapshot = FileSnapshot.capture(full_path, file_path)
+        after_snapshots[file_path] = snapshot
+
+    # Only create operation if something was successfully applied
+    operation = None
+    if results["success"]:
+        # Keep only relevant before_snapshots (files that were actually changed)
+        relevant_before = {k: v for k, v in before_snapshots.items() if k in after_snapshots}
+
+        operation = ApplyOperation(
+            timestamp=datetime.now(),
+            root_directory=root_directory,
+            before_snapshots=relevant_before,
+            after_snapshots=after_snapshots,
+            description=f"Applied {len(results['success'])} file(s)"
+        )
+
+    return results, operation
+
+def apply_selected_with_history(
+    changes: List[FileChange]
+) -> Tuple[Dict[str, List[str]], Optional[ApplyOperation]]:
+    """
+    Apply selected changes and return both results and an ApplyOperation for history.
+    Returns (results_dict, operation_or_none)
+    """
+    # Capture BEFORE snapshots for selected files
+    before_snapshots = {}
+    root_directory = None
+
+    for change in changes:
+        if change.selected and change.change_type != ChangeType.INVALID_PATH:
+            snapshot = FileSnapshot.capture(change.full_path, change.file_path)
+            before_snapshots[change.file_path] = snapshot
+            # Get root directory from the full path
+            if root_directory is None:
+                root_directory = os.path.dirname(change.full_path).split(change.file_path.replace('/', os.path.sep))[0].rstrip(os.path.sep)
+
+    # Apply the changes
+    results = apply_selected_changes(changes)
+
+    # Capture AFTER snapshots for successfully applied files
+    after_snapshots = {}
+    for change in changes:
+        if change.file_path in results["success"]:
+            snapshot = FileSnapshot.capture(change.full_path, change.file_path)
+            after_snapshots[change.file_path] = snapshot
+
+    # Only create operation if something was successfully applied
+    operation = None
+    if results["success"] and root_directory:
+        # Keep only relevant before_snapshots
+        relevant_before = {k: v for k, v in before_snapshots.items() if k in after_snapshots}
+
+        operation = ApplyOperation(
+            timestamp=datetime.now(),
+            root_directory=root_directory,
+            before_snapshots=relevant_before,
+            after_snapshots=after_snapshots,
+            description=f"Applied {len(results['success'])} selected file(s)"
+        )
+
+    return results, operation
