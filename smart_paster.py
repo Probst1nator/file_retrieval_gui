@@ -572,63 +572,103 @@ def preview_changes_to_files(content_to_apply: str, root_directory: str) -> List
     """
     Parses the content and generates a preview of all file changes without applying them.
     Returns a list of FileChange objects representing each file modification.
+
+    Supports multiple formats (tried in priority order):
+    1. **File:** annotation - e.g., "**File:** `path/to/file.ext`"
+    2. Heading immediately followed by code block - e.g., "# path/to/file.ext"
+    3. Code block with # path inside - e.g., "```\n# path/to/file.ext\n..."
     """
     changes: List[FileChange] = []
-    
-    # Pattern supports two formats:
-    # Format 1 (backticks): ### 1. `path/to/file.ext`
-    # Format 2 (simple): # path/to/file.ext
-    # Both require file extensions to distinguish from markdown headings
-    pattern = re.compile(r"^#+\s*(?:\d+\.\s*)?(?:`([^`]+\.[a-zA-Z0-9]+)`|([^\s`]+\.[a-zA-Z0-9]+)).*?\n```(?:[a-zA-Z0-9]*)?\n(.*?)\n```", re.DOTALL | re.MULTILINE)
-    if not pattern.search(content_to_apply):
-        # Fallback: code block with # path inside
-        pattern = re.compile(r"^```(?:[a-zA-Z0-9]*)?\n\s*#\s*(?:`([^`]+\.[a-zA-Z0-9]+)`|([^\s`]+\.[a-zA-Z0-9]+))\n(.*?)\n```", re.DOTALL | re.MULTILINE)
 
-    for match in pattern.finditer(content_to_apply):
-        file_path = (match.group(1) or match.group(2)).strip()
-        content = match.group(3)
+    # Define patterns in order of specificity (most specific first)
+    patterns = [
+        # Pattern 1: **File:** annotation (most explicit user intent)
+        (r'\*\*File:\*\*\s*`?([^\s`\n]+\.[a-zA-Z0-9]+)`?.*?\n```(?:[a-zA-Z0-9]*)?\n(.*?)\n```',
+         "file_annotation", 2),
 
-        # Validate path safety
-        if ".." in file_path or os.path.isabs(file_path):
-            changes.append(FileChange(
-                file_path=file_path,
-                content=content.strip(),
-                change_type=ChangeType.INVALID_PATH,
-                full_path="",
-                error_message=f"Unsafe path: {file_path}"
-            ))
-            continue
-        
-        full_path = os.path.join(root_directory, file_path.replace('/', os.path.sep))
-        
-        # Determine if this is a new file or modification
-        if os.path.exists(full_path):
-            try:
-                with open(full_path, 'r', encoding='utf-8') as f:
-                    original_content = f.read()
-                
-                changes.append(FileChange(
-                    file_path=file_path,
-                    content=content.strip() + '\n',
-                    change_type=ChangeType.MODIFY_FILE,
-                    full_path=full_path,
-                    original_content=original_content
-                ))
-            except Exception as e:
+        # Pattern 2: Heading with file path (allows text before path like "Update file.py")
+        (r"^#+\s*(?:\d+\.\s*)?.*?(?:`([^`]+\.[a-zA-Z0-9]+)`|([^\s`]+\.[a-zA-Z0-9]+)).*?\n```(?:[a-zA-Z0-9]*)?\n(.*?)\n```",
+         "heading_format", 3),
+
+        # Pattern 3: Code block with # path inside (fallback)
+        (r"^```(?:[a-zA-Z0-9]*)?\n\s*#\s*(?:`([^`]+\.[a-zA-Z0-9]+)`|([^\s`]+\.[a-zA-Z0-9]+))\n(.*?)\n```",
+         "inline_path", 3),
+    ]
+
+    # Track which files and code blocks we've already matched to avoid duplicates
+    matched_files = set()
+    matched_code_blocks = set()
+
+    for pattern_regex, pattern_name, content_group_idx in patterns:
+        pattern = re.compile(pattern_regex, re.DOTALL | re.MULTILINE)
+
+        for match in pattern.finditer(content_to_apply):
+            # Extract file path from first non-None capture group (excluding content)
+            groups = match.groups()
+            file_path = None
+            for i in range(len(groups) - 1):  # All groups except the last (content)
+                if groups[i]:
+                    file_path = groups[i].strip()
+                    break
+
+            if not file_path:
+                continue
+
+            # Skip if we've already processed this file (prioritize earlier patterns)
+            if file_path in matched_files:
+                continue
+
+            content = groups[content_group_idx - 1]  # Get content group
+
+            # Create a signature to detect duplicate code blocks
+            code_block_signature = (content[:100] if len(content) > 100 else content, len(content))
+            if code_block_signature in matched_code_blocks:
+                continue
+
+            matched_files.add(file_path)
+            matched_code_blocks.add(code_block_signature)
+
+            # Validate path safety
+            if ".." in file_path or os.path.isabs(file_path):
                 changes.append(FileChange(
                     file_path=file_path,
                     content=content.strip(),
                     change_type=ChangeType.INVALID_PATH,
-                    full_path=full_path,
-                    error_message=f"Cannot read existing file: {e}"
+                    full_path="",
+                    error_message=f"Unsafe path: {file_path}"
                 ))
-        else:
-            changes.append(FileChange(
-                file_path=file_path,
-                content=content.strip() + '\n',
-                change_type=ChangeType.NEW_FILE,
-                full_path=full_path
-            ))
+                continue
+
+            full_path = os.path.join(root_directory, file_path.replace('/', os.path.sep))
+
+            # Determine if this is a new file or modification
+            if os.path.exists(full_path):
+                try:
+                    with open(full_path, 'r', encoding='utf-8') as f:
+                        original_content = f.read()
+
+                    changes.append(FileChange(
+                        file_path=file_path,
+                        content=content.strip() + '\n',
+                        change_type=ChangeType.MODIFY_FILE,
+                        full_path=full_path,
+                        original_content=original_content
+                    ))
+                except Exception as e:
+                    changes.append(FileChange(
+                        file_path=file_path,
+                        content=content.strip(),
+                        change_type=ChangeType.INVALID_PATH,
+                        full_path=full_path,
+                        error_message=f"Cannot read existing file: {e}"
+                    ))
+            else:
+                changes.append(FileChange(
+                    file_path=file_path,
+                    content=content.strip() + '\n',
+                    change_type=ChangeType.NEW_FILE,
+                    full_path=full_path
+                ))
     
     return changes
 
@@ -658,36 +698,81 @@ def apply_selected_changes(changes: List[FileChange]) -> Dict[str, List[str]]:
     return results
 
 def apply_changes_to_files(content_to_apply: str, root_directory: str) -> Dict[str, List[str]]:
+    """
+    Apply changes to files using multi-pattern matching.
+
+    Supports multiple formats (tried in priority order):
+    1. **File:** annotation - e.g., "**File:** `path/to/file.ext`"
+    2. Heading immediately followed by code block - e.g., "# path/to/file.ext"
+    3. Code block with # path inside - e.g., "```\n# path/to/file.ext\n..."
+    """
     results: Dict[str, List[str]] = {"success": [], "errors": []}
     total_chars = 0
-    # Pattern supports two formats:
-    # Format 1 (backticks): ### 1. `path/to/file.ext`
-    # Format 2 (simple): # path/to/file.ext
-    # Both require file extensions to distinguish from markdown headings
-    pattern = re.compile(r"^#+\s*(?:\d+\.\s*)?(?:`([^`]+\.[a-zA-Z0-9]+)`|([^\s`]+\.[a-zA-Z0-9]+)).*?\n```(?:[a-zA-Z0-9]*)?\n(.*?)\n```", re.DOTALL | re.MULTILINE)
-    if not pattern.search(content_to_apply):
-        # Fallback: code block with # path inside
-        pattern = re.compile(r"^```(?:[a-zA-Z0-9]*)?\n\s*#\s*(?:`([^`]+\.[a-zA-Z0-9]+)`|([^\s`]+\.[a-zA-Z0-9]+))\n(.*?)\n```", re.DOTALL | re.MULTILINE)
 
-    for match in pattern.finditer(content_to_apply):
-        file_path = (match.group(1) or match.group(2)).strip()
-        content = match.group(3)
-        if ".." in file_path or os.path.isabs(file_path):
-            results["errors"].append(f"Skipped unsafe path: {file_path}")
-            continue
-        full_path = os.path.join(root_directory, file_path.replace('/', os.path.sep))
-        try:
-            os.makedirs(os.path.dirname(full_path), exist_ok=True)
-            # if "base64" in content_to_apply.split(file_path,1)[1].split("```",1):
-            #     with open(full_path, 'wb') as f: f.write(base64.b64decode(content.strip()))
-            # else:
-            content_stripped = content.strip()
-            with open(full_path, 'w', encoding='utf-8') as f: f.write(content_stripped + '\n')
-            results["success"].append(file_path)
-            total_chars += len(content_stripped)
-        except Exception as e:
-            results["errors"].append(f"Failed to write {file_path}: {e}")
-    
+    # Define patterns in order of specificity (most specific first)
+    patterns = [
+        # Pattern 1: **File:** annotation (most explicit user intent)
+        (r'\*\*File:\*\*\s*`?([^\s`\n]+\.[a-zA-Z0-9]+)`?.*?\n```(?:[a-zA-Z0-9]*)?\n(.*?)\n```',
+         "file_annotation", 2),
+
+        # Pattern 2: Heading with file path (allows text before path like "Update file.py")
+        (r"^#+\s*(?:\d+\.\s*)?.*?(?:`([^`]+\.[a-zA-Z0-9]+)`|([^\s`]+\.[a-zA-Z0-9]+)).*?\n```(?:[a-zA-Z0-9]*)?\n(.*?)\n```",
+         "heading_format", 3),
+
+        # Pattern 3: Code block with # path inside (fallback)
+        (r"^```(?:[a-zA-Z0-9]*)?\n\s*#\s*(?:`([^`]+\.[a-zA-Z0-9]+)`|([^\s`]+\.[a-zA-Z0-9]+))\n(.*?)\n```",
+         "inline_path", 3),
+    ]
+
+    # Track which files and code blocks we've already applied to avoid duplicates
+    matched_files = set()
+    matched_code_blocks = set()
+
+    for pattern_regex, pattern_name, content_group_idx in patterns:
+        pattern = re.compile(pattern_regex, re.DOTALL | re.MULTILINE)
+
+        for match in pattern.finditer(content_to_apply):
+            # Extract file path from first non-None capture group (excluding content)
+            groups = match.groups()
+            file_path = None
+            for i in range(len(groups) - 1):  # All groups except the last (content)
+                if groups[i]:
+                    file_path = groups[i].strip()
+                    break
+
+            if not file_path:
+                continue
+
+            # Skip if we've already processed this file (prioritize earlier patterns)
+            if file_path in matched_files:
+                continue
+
+            content = groups[content_group_idx - 1]  # Get content group
+
+            # Create a signature to detect duplicate code blocks
+            code_block_signature = (content[:100] if len(content) > 100 else content, len(content))
+            if code_block_signature in matched_code_blocks:
+                continue
+
+            matched_files.add(file_path)
+            matched_code_blocks.add(code_block_signature)
+
+            # Validate path safety
+            if ".." in file_path or os.path.isabs(file_path):
+                results["errors"].append(f"Skipped unsafe path: {file_path}")
+                continue
+
+            full_path = os.path.join(root_directory, file_path.replace('/', os.path.sep))
+            try:
+                os.makedirs(os.path.dirname(full_path), exist_ok=True)
+                content_stripped = content.strip()
+                with open(full_path, 'w', encoding='utf-8') as f:
+                    f.write(content_stripped + '\n')
+                results["success"].append(file_path)
+                total_chars += len(content_stripped)
+            except Exception as e:
+                results["errors"].append(f"Failed to write {file_path}: {e}")
+
     if not results["success"] and not results["errors"]:
         results["errors"].append("No valid file blocks found to apply.")
 
