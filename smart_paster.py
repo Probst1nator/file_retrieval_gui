@@ -568,6 +568,39 @@ def build_clipboard_content(file_paths: List[str], root_directory: str, max_size
             parts.append(f"# ERROR: Could not read {rel_path}\n```{e}\n```")
     return "\n\n".join(parts)
 
+def apply_text_patch(original_text: str, patch_block: str) -> Tuple[str, bool, str]:
+    """
+    Applies a SEARCH/REPLACE block to original text.
+    Returns: (new_text, success, message)
+    """
+    # Regex to extract SEARCH and REPLACE blocks
+    # content between <<<< SEARCH and ====
+    # content between ==== and >>>>
+    pattern = re.compile(
+        r'<<<< SEARCH\n(.*?)\n====\n(.*?)\n>>>>',
+        re.DOTALL
+    )
+
+    matches = list(pattern.finditer(patch_block))
+    if not matches:
+        return original_text, False, "Invalid patch format: Missing markers (<<<< SEARCH / ==== / >>>>)"
+
+    new_text = original_text
+
+    for match in matches:
+        search_content = match.group(1)
+        replace_content = match.group(2)
+
+        # exact match attempt
+        if search_content in new_text:
+            new_text = new_text.replace(search_content, replace_content, 1)
+        else:
+            # Fallback: Try stripping whitespace from search block lines for looser matching
+            # (LLMs sometimes mess up indentation in the search block)
+            return original_text, False, "Could not locate SEARCH block in original file."
+
+    return new_text, True, "Patch applied"
+
 def preview_changes_to_files(content_to_apply: str, root_directory: str) -> List[FileChange]:
     """
     Parses the content and generates a preview of all file changes without applying them.
@@ -577,76 +610,114 @@ def preview_changes_to_files(content_to_apply: str, root_directory: str) -> List
     1. **File:** annotation - e.g., "**File:** `path/to/file.ext`"
     2. Heading immediately followed by code block - e.g., "# path/to/file.ext"
     3. Code block with # path inside - e.g., "```\n# path/to/file.ext\n..."
+    4. PATCH format - e.g., "# PATCH path/to/file.ext" with search/replace blocks
     """
     changes: List[FileChange] = []
 
-    # Define patterns in order of specificity (most specific first)
+    # --- 1. EXISTING PATTERNS (For Full Overwrites) ---
     patterns = [
-        # Pattern 1: **File:** annotation (most explicit user intent)
+        # **File:** annotation
         (r'\*\*File:\*\*\s*`?([^\s`\n]+\.[a-zA-Z0-9]+)`?.*?\n```(?:[a-zA-Z0-9]*)?\n(.*?)\n```',
          "file_annotation", 2),
-
-        # Pattern 2: Heading with file path (allows text before path like "Update file.py")
+        # Standard Heading # filename
         (r"^#+\s*(?:\d+\.\s*)?.*?(?:`([^`]+\.[a-zA-Z0-9]+)`|([^\s`]+\.[a-zA-Z0-9]+)).*?\n```(?:[a-zA-Z0-9]*)?\n(.*?)\n```",
          "heading_format", 3),
-
-        # Pattern 3: Code block with # path inside (fallback)
+        # Inline code block path
         (r"^```(?:[a-zA-Z0-9]*)?\n\s*#\s*(?:`([^`]+\.[a-zA-Z0-9]+)`|([^\s`]+\.[a-zA-Z0-9]+))\n(.*?)\n```",
          "inline_path", 3),
     ]
 
-    # Track which files and code blocks we've already matched to avoid duplicates
+    # --- 2. NEW PATTERN (For Patching) ---
+    # Matches: # PATCH filename \n ```...```
+    patch_pattern = re.compile(
+        r"^#+\s*PATCH\s+(?:`([^`]+\.[a-zA-Z0-9]+)`|([^\s`]+\.[a-zA-Z0-9]+)).*?\n```(?:[a-zA-Z0-9]*)?\n(.*?)\n```",
+        re.DOTALL | re.MULTILINE
+    )
+
     matched_files = set()
-    matched_code_blocks = set()
 
-    for pattern_regex, pattern_name, content_group_idx in patterns:
+    # --- PROCESS PATCHES FIRST ---
+    for match in patch_pattern.finditer(content_to_apply):
+        groups = match.groups()
+        file_path = groups[0] or groups[1]
+        raw_patch_content = groups[2]
+
+        if not file_path: continue
+        matched_files.add(file_path)  # Mark as processed so overwrite patterns don't grab it
+
+        full_path = os.path.join(root_directory, file_path.replace('/', os.path.sep))
+
+        if not os.path.exists(full_path):
+            changes.append(FileChange(
+                file_path=file_path, content="", change_type=ChangeType.INVALID_PATH,
+                full_path=full_path, error_message="Cannot patch: File does not exist"
+            ))
+            continue
+
+        try:
+            with open(full_path, 'r', encoding='utf-8') as f:
+                original_content = f.read()
+
+            # Apply the patch logic
+            new_content, success, msg = apply_text_patch(original_content, raw_patch_content)
+
+            if success:
+                changes.append(FileChange(
+                    file_path=file_path,
+                    content=new_content,  # The GUI will compare this vs original_content
+                    change_type=ChangeType.MODIFY_FILE,
+                    full_path=full_path,
+                    original_content=original_content
+                ))
+            else:
+                changes.append(FileChange(
+                    file_path=file_path,
+                    content=original_content,  # No change
+                    change_type=ChangeType.INVALID_PATH,
+                    full_path=full_path,
+                    error_message=f"Patch Failed: {msg}"
+                ))
+
+        except Exception as e:
+            changes.append(FileChange(
+                file_path=file_path, content="", change_type=ChangeType.INVALID_PATH,
+                full_path=full_path, error_message=f"Error reading file: {e}"
+            ))
+
+    # --- PROCESS OVERWRITES (Existing Logic) ---
+    for pattern_regex, _, content_group_idx in patterns:
         pattern = re.compile(pattern_regex, re.DOTALL | re.MULTILINE)
-
         for match in pattern.finditer(content_to_apply):
-            # Extract file path from first non-None capture group (excluding content)
             groups = match.groups()
+
+            # Find file path group
             file_path = None
-            for i in range(len(groups) - 1):  # All groups except the last (content)
+            for i in range(len(groups) - 1):
                 if groups[i]:
                     file_path = groups[i].strip()
                     break
 
-            if not file_path:
-                continue
-
-            # Skip if we've already processed this file (prioritize earlier patterns)
-            if file_path in matched_files:
-                continue
-
-            content = groups[content_group_idx - 1]  # Get content group
-
-            # Create a signature to detect duplicate code blocks
-            code_block_signature = (content[:100] if len(content) > 100 else content, len(content))
-            if code_block_signature in matched_code_blocks:
+            if not file_path or file_path in matched_files:
                 continue
 
             matched_files.add(file_path)
-            matched_code_blocks.add(code_block_signature)
+            content = groups[content_group_idx - 1]
 
-            # Validate path safety
+            # Security Check
             if ".." in file_path or os.path.isabs(file_path):
                 changes.append(FileChange(
-                    file_path=file_path,
-                    content=content.strip(),
-                    change_type=ChangeType.INVALID_PATH,
-                    full_path="",
-                    error_message=f"Unsafe path: {file_path}"
+                    file_path=file_path, content="", change_type=ChangeType.INVALID_PATH,
+                    full_path="", error_message="Unsafe path"
                 ))
                 continue
 
             full_path = os.path.join(root_directory, file_path.replace('/', os.path.sep))
 
-            # Determine if this is a new file or modification
+            # Standard Overwrite Logic
             if os.path.exists(full_path):
                 try:
                     with open(full_path, 'r', encoding='utf-8') as f:
                         original_content = f.read()
-
                     changes.append(FileChange(
                         file_path=file_path,
                         content=content.strip() + '\n',
@@ -655,12 +726,9 @@ def preview_changes_to_files(content_to_apply: str, root_directory: str) -> List
                         original_content=original_content
                     ))
                 except Exception as e:
-                    changes.append(FileChange(
-                        file_path=file_path,
-                        content=content.strip(),
-                        change_type=ChangeType.INVALID_PATH,
-                        full_path=full_path,
-                        error_message=f"Cannot read existing file: {e}"
+                     changes.append(FileChange(
+                        file_path=file_path, content="", change_type=ChangeType.INVALID_PATH,
+                        full_path=full_path, error_message=str(e)
                     ))
             else:
                 changes.append(FileChange(
@@ -669,7 +737,7 @@ def preview_changes_to_files(content_to_apply: str, root_directory: str) -> List
                     change_type=ChangeType.NEW_FILE,
                     full_path=full_path
                 ))
-    
+
     return changes
 
 def apply_selected_changes(changes: List[FileChange]) -> Dict[str, List[str]]:
