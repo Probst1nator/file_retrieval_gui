@@ -9,10 +9,9 @@ import fitz  # PyMuPDF
 from odf import text, teletype
 from odf.opendocument import load as odf_load
 
-# Local import for the AI class
+# Local imports
+from exclusion_patterns import PatternMatcher, DEFAULT_EXCLUSION_PATTERNS
 
-IGNORE_DIRS: Set[str] = {"__pycache__", "node_modules", "venv", "dist", "build", ".git", ".idea", ".vscode"}
-IGNORE_FILES: Set[str] = {".DS_Store", ".gitignore", ".env"}
 CACHE_FILENAME = ".file_copier_cache.json"
 
 class ChangeType(Enum):
@@ -241,37 +240,63 @@ def apply_snapshots(snapshots: Dict[str, FileSnapshot]) -> Dict[str, List[str]]:
 
 # --- All clipboard/request processing logic is now centralized here ---
 
-def generate_project_tree(directory: str, exclusion_regex: Optional[re.Pattern] = None) -> str:
+def generate_project_tree(
+    directory: str,
+    exclusion_regex: Optional[re.Pattern] = None,
+    pattern_matcher: Optional[PatternMatcher] = None
+) -> str:
     """Generates a string representation of the project's file tree.
 
     Args:
         directory: Root directory to scan
-        exclusion_regex: Optional compiled regex to filter out paths. If None, uses default IGNORE_DIRS/IGNORE_FILES.
+        exclusion_regex: Optional compiled regex to filter out paths (legacy support)
+        pattern_matcher: Optional PatternMatcher instance for glob-based exclusion
     """
+    # Create default matcher if none provided
+    if pattern_matcher is None and exclusion_regex is None:
+        pattern_matcher = PatternMatcher(use_defaults=True)
+
     file_list = []
     for root, dirs, files in os.walk(directory, topdown=True):
         rel_root = os.path.relpath(root, directory).replace(os.path.sep, '/')
-        if exclusion_regex:
-            dirs[:] = [d for d in dirs if not exclusion_regex.search(f"{rel_root}/{d}/".replace('./', ''))]
-        else:
-            dirs[:] = [d for d in dirs if d not in IGNORE_DIRS]
+
+        # Filter directories
+        if pattern_matcher:
+            dirs[:] = [d for d in dirs
+                      if not pattern_matcher.should_exclude(f"{rel_root}/{d}/".replace('./', ''))]
+        elif exclusion_regex:
+            dirs[:] = [d for d in dirs
+                      if not exclusion_regex.search(f"{rel_root}/{d}/".replace('./', ''))]
+
+        # Filter files
         for name in files:
             rel_path = os.path.relpath(os.path.join(root, name), directory).replace('\\', '/')
-            if exclusion_regex:
+
+            if pattern_matcher:
+                if not pattern_matcher.should_exclude(rel_path):
+                    file_list.append(rel_path)
+            elif exclusion_regex:
                 if not exclusion_regex.search(rel_path):
                     file_list.append(rel_path)
-            else:
-                if name not in IGNORE_FILES and name != CACHE_FILENAME:
-                    file_list.append(rel_path)
+
     return "\n".join(sorted(file_list))
 
-def generate_visual_tree(directory: str, exclusion_regex: Optional[re.Pattern] = None) -> str:
+def generate_visual_tree(
+    directory: str,
+    exclusion_regex: Optional[re.Pattern] = None,
+    pattern_matcher: Optional[PatternMatcher] = None
+) -> str:
     """Generates a visual ASCII tree representation of the project structure.
 
     Args:
         directory: Root directory to scan
-        exclusion_regex: Optional compiled regex to filter out paths. If None, uses default IGNORE_DIRS/IGNORE_FILES.
+        exclusion_regex: Optional compiled regex to filter out paths (legacy support)
+        pattern_matcher: Optional PatternMatcher instance for glob-based exclusion
     """
+    # Create default matcher if none provided
+    if pattern_matcher is None and exclusion_regex is None:
+        pattern_matcher = PatternMatcher(use_defaults=True)
+
     tree_lines = ["# Project Structure", "```"]
     base_dir = os.path.abspath(directory)
 
@@ -283,20 +308,27 @@ def generate_visual_tree(directory: str, exclusion_regex: Optional[re.Pattern] =
 
         rel_dir = os.path.relpath(current_dir, base_dir).replace(os.path.sep, '/')
 
-        if exclusion_regex:
-            filtered_items = []
-            for i in items:
-                item_rel_path = f"{rel_dir}/{i}".replace('./', '') if rel_dir != '.' else i
-                # For directories, check with trailing slash
-                if os.path.isdir(os.path.join(current_dir, i)):
+        filtered_items = []
+        for i in items:
+            item_rel_path = f"{rel_dir}/{i}".replace('./', '') if rel_dir != '.' else i
+
+            # For directories, check with trailing slash
+            if os.path.isdir(os.path.join(current_dir, i)):
+                if pattern_matcher:
+                    if not pattern_matcher.should_exclude(f"{item_rel_path}/"):
+                        filtered_items.append(i)
+                elif exclusion_regex:
                     if not exclusion_regex.search(f"{item_rel_path}/"):
                         filtered_items.append(i)
-                else:
+            else:
+                if pattern_matcher:
+                    if not pattern_matcher.should_exclude(item_rel_path):
+                        filtered_items.append(i)
+                elif exclusion_regex:
                     if not exclusion_regex.search(item_rel_path):
                         filtered_items.append(i)
-            items = filtered_items
-        else:
-            items = [i for i in items if i not in IGNORE_DIRS and i not in IGNORE_FILES and i != CACHE_FILENAME]
+
+        items = filtered_items
 
         for i, item in enumerate(items):
             path = os.path.join(current_dir, item)
@@ -461,21 +493,36 @@ def _is_likely_code_block(text: str) -> bool:
     return len(text.strip()) > 0
 
 
-async def process_smart_request(user_request: str, directory: str) -> List[str]:
+async def process_smart_request(
+    user_request: str,
+    directory: str,
+    pattern_matcher: Optional[PatternMatcher] = None
+) -> List[str]:
     """
     The main orchestrator for smart file discovery.
     Uses prioritized regex patterns and matching strategies to find the most accurate filepaths.
+
+    Args:
+        user_request: User's request string
+        directory: Base directory to search
+        pattern_matcher: Optional PatternMatcher for exclusions
     """
     # Ensure the base directory is an absolute path for reliable comparisons
     base_directory = os.path.abspath(directory)
 
+    # Create default matcher if none provided
+    if pattern_matcher is None:
+        pattern_matcher = PatternMatcher(use_defaults=True)
+
     # Get all files in the project first, as relative paths
     all_project_files = []
     for root, dirs, files in os.walk(base_directory, topdown=True):
-        dirs[:] = [d for d in dirs if d not in IGNORE_DIRS]
+        rel_root = os.path.relpath(root, base_directory).replace(os.path.sep, '/')
+        dirs[:] = [d for d in dirs
+                  if not pattern_matcher.should_exclude(f"{rel_root}/{d}/".replace('./', ''))]
         for name in files:
-            if name not in IGNORE_FILES and name != CACHE_FILENAME:
-                rel_path = os.path.relpath(os.path.join(root, name), base_directory).replace('\\', '/')
+            rel_path = os.path.relpath(os.path.join(root, name), base_directory).replace('\\', '/')
+            if not pattern_matcher.should_exclude(rel_path):
                 all_project_files.append(rel_path)
     
     matched_files = set()
@@ -560,17 +607,36 @@ def get_language_hint(filename: str) -> str:
     lang = os.path.splitext(filename)[1][1:].lower()
     return {'yml': 'yaml', 'sh': 'bash', 'py': 'python'}.get(lang, lang)
 
-def get_current_project_state(directory: str) -> Dict[str, float]:
+def get_current_project_state(
+    directory: str,
+    pattern_matcher: Optional[PatternMatcher] = None
+) -> Dict[str, float]:
+    """Get current state of all non-excluded files with their modification times.
+
+    Args:
+        directory: Directory to scan
+        pattern_matcher: Optional PatternMatcher for exclusions
+
+    Returns:
+        Dict mapping relative file paths to their modification times
+    """
+    # Create default matcher if none provided
+    if pattern_matcher is None:
+        pattern_matcher = PatternMatcher(use_defaults=True)
+
     state = {}
     for root, dirs, files in os.walk(directory, topdown=True):
-        dirs[:] = [d for d in dirs if d not in IGNORE_DIRS]
+        rel_root = os.path.relpath(root, directory).replace(os.path.sep, '/')
+        dirs[:] = [d for d in dirs
+                  if not pattern_matcher.should_exclude(f"{rel_root}/{d}/".replace('./', ''))]
         for name in files:
-            if name in IGNORE_FILES or name == CACHE_FILENAME: continue
-            try:
-                abs_path = os.path.join(root, name)
-                rel_path = os.path.relpath(abs_path, directory).replace(os.path.sep, '/')
-                state[rel_path] = os.path.getmtime(abs_path)
-            except OSError: continue
+            rel_path = os.path.relpath(os.path.join(root, name), directory).replace(os.path.sep, '/')
+            if not pattern_matcher.should_exclude(rel_path):
+                try:
+                    abs_path = os.path.join(root, name)
+                    state[rel_path] = os.path.getmtime(abs_path)
+                except OSError:
+                    continue
     return state
 
 def build_clipboard_content(file_paths: List[str], root_directory: str, max_size: Optional[int] = None, append_tree: bool = False, exclusion_regex: Optional[re.Pattern] = None) -> str:
