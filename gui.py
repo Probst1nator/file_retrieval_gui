@@ -2307,7 +2307,6 @@ Creates new files if path doesn't exist; overwrites if it does.
 ## Rules
 - Relative paths only (no `..` or absolute)
 - File extension required
-- Use **Preview Changes** before applying
 
 ## Project Structure:
 {project_tree}"""
