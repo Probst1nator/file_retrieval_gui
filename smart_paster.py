@@ -1,4 +1,3 @@
-# tools/file_copier/smart_paster.py
 import os
 import re
 from typing import List, Tuple, Optional, Dict, Set
@@ -242,16 +241,78 @@ def apply_snapshots(snapshots: Dict[str, FileSnapshot]) -> Dict[str, List[str]]:
 
 # --- All clipboard/request processing logic is now centralized here ---
 
-def generate_project_tree(directory: str) -> str:
-    """Generates a string representation of the project's file tree."""
+def generate_project_tree(directory: str, exclusion_regex: Optional[re.Pattern] = None) -> str:
+    """Generates a string representation of the project's file tree.
+
+    Args:
+        directory: Root directory to scan
+        exclusion_regex: Optional compiled regex to filter out paths. If None, uses default IGNORE_DIRS/IGNORE_FILES.
+    """
     file_list = []
     for root, dirs, files in os.walk(directory, topdown=True):
-        dirs[:] = [d for d in dirs if d not in IGNORE_DIRS]
+        rel_root = os.path.relpath(root, directory).replace(os.path.sep, '/')
+        if exclusion_regex:
+            dirs[:] = [d for d in dirs if not exclusion_regex.search(f"{rel_root}/{d}/".replace('./', ''))]
+        else:
+            dirs[:] = [d for d in dirs if d not in IGNORE_DIRS]
         for name in files:
-            if name not in IGNORE_FILES and name != CACHE_FILENAME:
-                rel_path = os.path.relpath(os.path.join(root, name), directory).replace('\\', '/')
-                file_list.append(rel_path)
+            rel_path = os.path.relpath(os.path.join(root, name), directory).replace('\\', '/')
+            if exclusion_regex:
+                if not exclusion_regex.search(rel_path):
+                    file_list.append(rel_path)
+            else:
+                if name not in IGNORE_FILES and name != CACHE_FILENAME:
+                    file_list.append(rel_path)
     return "\n".join(sorted(file_list))
+
+def generate_visual_tree(directory: str, exclusion_regex: Optional[re.Pattern] = None) -> str:
+    """Generates a visual ASCII tree representation of the project structure.
+
+    Args:
+        directory: Root directory to scan
+        exclusion_regex: Optional compiled regex to filter out paths. If None, uses default IGNORE_DIRS/IGNORE_FILES.
+    """
+    tree_lines = ["# Project Structure", "```"]
+    base_dir = os.path.abspath(directory)
+
+    def _build_tree(current_dir, prefix=""):
+        try:
+            items = sorted(os.listdir(current_dir))
+        except PermissionError:
+            return
+
+        rel_dir = os.path.relpath(current_dir, base_dir).replace(os.path.sep, '/')
+
+        if exclusion_regex:
+            filtered_items = []
+            for i in items:
+                item_rel_path = f"{rel_dir}/{i}".replace('./', '') if rel_dir != '.' else i
+                # For directories, check with trailing slash
+                if os.path.isdir(os.path.join(current_dir, i)):
+                    if not exclusion_regex.search(f"{item_rel_path}/"):
+                        filtered_items.append(i)
+                else:
+                    if not exclusion_regex.search(item_rel_path):
+                        filtered_items.append(i)
+            items = filtered_items
+        else:
+            items = [i for i in items if i not in IGNORE_DIRS and i not in IGNORE_FILES and i != CACHE_FILENAME]
+
+        for i, item in enumerate(items):
+            path = os.path.join(current_dir, item)
+            is_last = (i == len(items) - 1)
+            connector = "└── " if is_last else "├── "
+
+            tree_lines.append(f"{prefix}{connector}{item}")
+
+            if os.path.isdir(path):
+                extension_prefix = "    " if is_last else "│   "
+                _build_tree(path, prefix + extension_prefix)
+
+    tree_lines.append(os.path.basename(base_dir) + "/")
+    _build_tree(base_dir)
+    tree_lines.append("```")
+    return "\n".join(tree_lines)
 
 def parse_clipboard_for_paths_and_code(message: str, directory: str) -> Tuple[List[str], List[str]]:
     """
@@ -512,7 +573,7 @@ def get_current_project_state(directory: str) -> Dict[str, float]:
             except OSError: continue
     return state
 
-def build_clipboard_content(file_paths: List[str], root_directory: str, max_size: Optional[int] = None) -> str:
+def build_clipboard_content(file_paths: List[str], root_directory: str, max_size: Optional[int] = None, append_tree: bool = False, exclusion_regex: Optional[re.Pattern] = None) -> str:
     parts, current_size = [], 0
     for i, abs_path in enumerate(file_paths):
         rel_path = os.path.relpath(abs_path, root_directory).replace(os.path.sep, '/')
@@ -566,7 +627,15 @@ def build_clipboard_content(file_paths: List[str], root_directory: str, max_size
                 if max_size: current_size += len(block)
         except Exception as e:
             parts.append(f"# ERROR: Could not read {rel_path}\n```{e}\n```")
-    return "\n\n".join(parts)
+    
+    final_output = "\n\n".join(parts)
+    if append_tree:
+        tree_str = generate_visual_tree(root_directory, exclusion_regex)
+        if final_output:
+            final_output += "\n\n" + tree_str
+        else:
+            final_output = tree_str
+    return final_output
 
 def apply_text_patch(original_text: str, patch_block: str) -> Tuple[str, bool, str]:
     """

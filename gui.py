@@ -43,7 +43,8 @@ from smart_paster import (
     apply_changes_with_history, apply_selected_with_history,
     validate_file_state, apply_snapshots,
     ApplyHistoryManager, FileSnapshot, ApplyOperation,
-    IGNORE_DIRS, build_clipboard_content, process_smart_request, FileChange, ChangeType
+    IGNORE_DIRS, build_clipboard_content, process_smart_request, FileChange, ChangeType,
+    generate_visual_tree
 )
 from ollama_client import OllamaClient, OllamaConfig
 
@@ -171,6 +172,7 @@ class FileCopierApp:
         self.drag_enabled: bool = True
         self._copy_timer: Optional[str] = None  # Timer for the 'Copied!' label
         self.apply_history = ApplyHistoryManager()  # History for undo/redo
+        self.append_filetree_var = tk.BooleanVar(value=False)
 
     def _initialize_agentic_search_state(self):
         """Initialize state for the Agentic Search tab."""
@@ -350,12 +352,14 @@ class FileCopierApp:
 
     def _update_and_broadcast_string(self):
         selected_files = self._get_selected_files_ordered()
-        if not selected_files:
+        if not selected_files and not self.append_filetree_var.get():
             self.current_shared_string = "No files selected."
         else:
             self.current_shared_string = build_clipboard_content(
                 [os.path.join(self.directory, f) for f in selected_files],
-                self.directory
+                self.directory,
+                append_tree=self.append_filetree_var.get(),
+                exclusion_regex=self._get_exclusion_regex()
             )
         self._safe_broadcast_update()
 
@@ -472,6 +476,7 @@ class FileCopierApp:
         style.map('Accent.TButton', background=[('active', '#106ebe')])
         style.configure('Danger.TButton', font=(base_font[0], base_font[1], "bold"), background="#d32f2f", foreground=DARK_FG)
         style.map('Danger.TButton', background=[('active', '#b71c1c')])
+        style.configure("Small.TButton", font=(base_font[0], base_font[1] - 2), padding=1)
         style.configure("TNotebook", background=DARK_BG, borderwidth=0)
         style.configure("TNotebook.Tab", background=DARK_BUTTON_BG, foreground=DARK_FG, padding=[8, 4])
         style.map("TNotebook.Tab", background=[("selected", DARK_SELECT_BG)], expand=[("selected", [1, 1, 1, 0])])
@@ -507,6 +512,10 @@ class FileCopierApp:
         # New label for "Copied!" notification - packed to the RIGHT (so it appears left of the copy button)
         self.copied_label = ttk.Label(bottom_controls_frame, text="", foreground="#4CAF50", font=("Segoe UI", 10, "bold"))
         self.copied_label.pack(side=tk.RIGHT, padx=(0, 10))
+
+        # Right-aligned checkbox
+        self.chk_append_tree = ttk.Checkbutton(bottom_controls_frame, text="Append Filetree", variable=self.append_filetree_var, command=self._update_ui_state)
+        self.chk_append_tree.pack(side=tk.RIGHT, padx=(0, 20))
 
         self._create_preview_widgets()
 
@@ -640,7 +649,11 @@ class FileCopierApp:
         apply_changes_frame = ttk.Frame(tools_container)
         apply_changes_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(5, 0))
 
-        ttk.Label(apply_changes_frame, text="Apply Changes to Files", font=("Segoe UI", 10, "bold")).pack(anchor='w')
+        apply_header_row = ttk.Frame(apply_changes_frame)
+        apply_header_row.pack(fill=tk.X)
+
+        ttk.Label(apply_header_row, text="Apply Changes to Files", font=("Segoe UI", 10, "bold")).pack(side=tk.LEFT)
+        ttk.Button(apply_header_row, text="Copy Usage Instruction", style="Small.TButton", command=self._copy_usage_instruction).pack(side=tk.LEFT, padx=(10, 0))
 
         # Pack controls at bottom first
         apply_changes_controls = ttk.Frame(apply_changes_frame)
@@ -2046,12 +2059,12 @@ Working directory: {self.directory}
             messagebox.showerror("Error", "Install pyperclip: pip install pyperclip")
             return
         selected = self._get_selected_files_ordered()
-        if not selected:
-            self._log_message("Copy: No files selected.", 'warning')
+        if not selected and not self.append_filetree_var.get():
+            self._log_message("Copy: No files selected and Filetree disabled.", 'warning')
             return
-        self._log_message("Copy: Processing files...")
+        self._log_message("Copy: Processing content...")
         self.root.update_idletasks()
-        out = build_clipboard_content([os.path.join(self.directory, f) for f in selected], self.directory)
+        out = build_clipboard_content([os.path.join(self.directory, f) for f in selected], self.directory, append_tree=self.append_filetree_var.get(), exclusion_regex=self._get_exclusion_regex())
         pyperclip.copy(out)
         
         # Show temporary "Copied!" label
@@ -2261,6 +2274,48 @@ Working directory: {self.directory}
         if self.websocket_enabled:
             threading.Thread(target=self._start_websocket_server, daemon=True).start()
             self.root.after(2000, self._safe_broadcast_update)
+
+    def _copy_usage_instruction(self):
+        # Generate project tree using user's exclusion settings
+        exclusion_regex = self._get_exclusion_regex()
+        project_tree = generate_visual_tree(self.directory, exclusion_regex)
+
+        instruction = f"""# Apply Changes - Usage
+
+## Surgical Patch (modify sections of existing files)
+```
+# PATCH path/to/file.ext
+```lang
+<<<< SEARCH
+[exact existing code]
+====
+[replacement code]
+>>>>
+```
+- SEARCH must match exactly (whitespace matters)
+- First occurrence only; file must exist
+- Can include multiple SEARCH/REPLACE blocks
+
+## Full Overwrite (replace entire file or create new)
+Format options (any work):
+- **File:** `path/to/file.ext` followed by code block
+- `# path/to/file.ext` + code block
+- Code block with `# path/to/file.ext` as first line
+
+Creates new files if path doesn't exist; overwrites if it does.
+
+## Rules
+- Relative paths only (no `..` or absolute)
+- File extension required
+- Use **Preview Changes** before applying
+
+## Project Structure:
+{project_tree}"""
+        if pyperclip:
+            pyperclip.copy(instruction)
+            self._log_message("Usage instructions copied to clipboard.", "success")
+        else:
+            self._log_message("Pyperclip not installed.", "error")
 
 
 class PreviewChangesDialog:
