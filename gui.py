@@ -1,0 +1,2695 @@
+# tools/file_copier/gui.py
+import os
+import sys
+import json
+import tkinter as tk
+from tkinter import ttk, messagebox, scrolledtext, simpledialog
+from typing import Dict, List, Optional, Set
+from dataclasses import dataclass, field
+from enum import Enum
+import threading
+import asyncio
+import fnmatch
+import signal
+import re
+from datetime import datetime
+
+# Third-party libraries
+from dotenv import load_dotenv
+import websockets
+try:
+    import pyperclip
+except ImportError:
+    pyperclip = None
+
+try:
+    from PIL import Image, ImageTk
+except ImportError:
+    Image = None
+    ImageTk = None
+
+try:
+    from ctypes import windll  # type: ignore
+except (ImportError, AttributeError):
+    windll = None # Define as None on non-Windows systems
+
+# Local application imports
+# Must modify path before importing from local modules
+current_dir = os.path.dirname(os.path.abspath(__file__))
+if current_dir not in sys.path:
+    sys.path.insert(0, current_dir)
+from smart_paster import (
+    apply_changes_to_files, preview_changes_to_files, apply_selected_changes,
+    apply_changes_with_history, apply_selected_with_history,
+    validate_file_state, apply_snapshots,
+    ApplyHistoryManager, FileSnapshot, ApplyOperation,
+    build_clipboard_content, process_smart_request, FileChange, ChangeType,
+    generate_visual_tree
+)
+from exclusion_patterns import DEFAULT_EXCLUSION_PATTERNS, parse_pattern_string, parse_gitignore
+from ollama_client import OllamaClient, OllamaConfig
+
+# Load environment variables after imports
+load_dotenv()
+
+# High DPI scaling for Windows
+if sys.platform == "win32" and windll:
+    try:
+        windll.shcore.SetProcessDpiAwareness(1)
+    except AttributeError:
+        # Might be an older version of Windows
+        pass
+
+
+# --- NEW: WebSocket Server Configuration ---
+# Support environment variables with fallback to defaults
+WEBSOCKET_HOST = os.getenv("WEBSOCKET_HOST", "localhost")
+WEBSOCKET_PORT = int(os.getenv("WEBSOCKET_PORT", "8765"))
+WEBSOCKET_PORT_RANGE_START = 8765
+WEBSOCKET_PORT_RANGE_END = 8769
+# --- END NEW ---
+
+DEFAULT_PRESET_NAME = "default"
+CONFIG_FILENAME = ".file_copier_config.json"
+
+def get_default_exclude_dirs() -> str:
+    """Extract default directory names from DEFAULT_EXCLUSION_PATTERNS"""
+    patterns = parse_pattern_string(DEFAULT_EXCLUSION_PATTERNS)
+    dirs = []
+    for pattern in patterns:
+        # Extract directory patterns like **/.git/**, **/__pycache__/**
+        if pattern.startswith('**/') and ('/**' in pattern or pattern.endswith('/**')):
+            # Extract the directory name
+            dir_name = pattern.replace('**/', '').replace('/**', '').rstrip('/')
+            # Remove wildcards for simple directory names
+            if '*' not in dir_name:
+                dirs.append(dir_name)
+    return " ".join(sorted(dirs))
+
+def get_default_advanced_exclusion_regex() -> str:
+    """Generate default advanced exclusion regex from DEFAULT_EXCLUSION_PATTERNS"""
+    patterns = parse_pattern_string(DEFAULT_EXCLUSION_PATTERNS)
+    # Convert glob patterns to regex-style for backward compatibility
+    regex_patterns = []
+    for pattern in patterns:
+        # Convert simple glob patterns to regex format used in advanced mode
+        if pattern.startswith('**/') and pattern.endswith('/**'):
+            # Directory pattern: **/.git/** -> \.git/
+            dir_name = pattern.replace('**/', '').replace('/**', '')
+            regex_patterns.append(re.escape(dir_name) + '/')
+        elif pattern.startswith('**/') and pattern.endswith('/'):
+            # Directory pattern: **/.git/ -> \.git/
+            dir_name = pattern.replace('**/', '').rstrip('/')
+            regex_patterns.append(re.escape(dir_name) + '/')
+        elif pattern.startswith('**/') and '.' in pattern:
+            # File pattern: **/*.log -> .*\.log$
+            file_ext = pattern.replace('**/', '').replace('*', '')
+            regex_patterns.append(r'.*' + re.escape(file_ext) + '$')
+    return "|".join(regex_patterns)
+
+DARK_BG, DARK_FG, DARK_SELECT_BG = "#2b2b2b", "#ffffff", "#404040"
+DARK_ENTRY_BG, DARK_BUTTON_BG, DARK_TREE_BG = "#3c3c3c", "#404040", "#2b2b2b"
+DARK_ERROR_FG = "#F44336" # Red for errors/unsupported files
+
+# Chat bubble colors for Agentic Search
+BUBBLE_USER_BG = "#0078d4"      # Blue (matches Accent.TButton)
+BUBBLE_AGENT_BG = "#404040"     # Dark gray
+BUBBLE_USER_FG = "#ffffff"
+BUBBLE_AGENT_FG = "#ffffff"
+
+# File extraction pattern for agent responses
+FILE_EXTRACTION_PATTERN = re.compile(r'\[FILES?:\s*([^\]]+)\]', re.IGNORECASE)
+
+
+class MessageRole(Enum):
+    """Role of a chat message."""
+    USER = "user"
+    ASSISTANT = "assistant"
+    SYSTEM = "system"
+
+
+@dataclass
+class ChatMessage:
+    """Represents a single chat message in the agentic search interface."""
+    role: MessageRole
+    content: str
+    timestamp: datetime = field(default_factory=datetime.now)
+    extracted_files: List[str] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, str]:
+        """Convert to dict for Ollama API."""
+        return {"role": self.role.value, "content": self.content}
+
+def is_text_file(filepath: str) -> bool:
+    try:
+        with open(filepath, 'rb') as f:
+            return b'\0' not in f.read(1024)
+    except (IOError, PermissionError):
+        return False
+
+def is_includable_file(filepath: str) -> bool:
+    ext = os.path.splitext(filepath)[1].lower()
+    if ext in {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp', '.pdf', '.odt'}:
+        return True
+    return is_text_file(filepath)
+
+def get_script_directory() -> str:
+    try:
+        return os.path.dirname(os.path.abspath(__file__))
+    except NameError:
+        return os.getcwd()
+
+def format_filesize(size_bytes: int) -> str:
+    """Format file size adaptively (KB/MB/GB)."""
+    if size_bytes < 1024:
+        return f"{size_bytes} B"
+    elif size_bytes < 1024 * 1024:
+        return f"{size_bytes / 1024:.2f} KB"
+    elif size_bytes < 1024 * 1024 * 1024:
+        return f"{size_bytes / (1024 * 1024):.2f} MB"
+    else:
+        return f"{size_bytes / (1024 * 1024 * 1024):.2f} GB"
+
+def format_timestamp(timestamp: float) -> str:
+    """Format timestamp as absolute datetime with second precision."""
+    dt = datetime.fromtimestamp(timestamp)
+    return dt.strftime('%Y-%m-%d %H:%M:%S')
+
+class FileCopierApp:
+    def __init__(self, root: tk.Tk, directory: str):
+        self.root = root
+        self.directory = os.path.abspath(directory)
+        self.config_file_path = os.path.join(get_script_directory(), CONFIG_FILENAME)
+        self._initialize_state()
+        self._initialize_websocket_state()
+        self._initialize_agentic_search_state()
+        self._setup_styles()
+        self._create_widgets()
+        self._bind_events()
+        self._setup_interrupt_handler()
+        self._log_message("Initializing...")
+        self.load_project_config()
+        self.root.after(100, self.start_async_project_load)
+        self.root.after(500, self._delayed_websocket_start)
+
+    def _initialize_state(self):
+        self.selected_files_map: Dict[str, bool] = {}
+        self.file_metadata: Dict[str, Dict] = {}  # Store raw metadata for sorting
+        self.preview_visible = False
+        self.all_text_files: List[str] = []
+        self._search_job: Optional[str] = None
+        self._auto_save_job: Optional[str] = None
+        self.full_config: Dict[str, Dict] = {}
+        self.presets: Dict[str, Dict] = {}
+        self.drag_start_item: Optional[str] = None
+        self.supported_binary_ext = {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp', '.pdf', '.odt'}
+        self.sort_column: Optional[str] = None
+        self.sort_reverse: bool = False
+        self.drag_enabled: bool = True
+        self._copy_timer: Optional[str] = None  # Timer for the 'Copied!' label
+        self.apply_history = ApplyHistoryManager()  # History for undo/redo
+        self.append_filetree_var = tk.BooleanVar(value=False)
+
+    def _initialize_agentic_search_state(self):
+        """Initialize state for the Agentic Search tab."""
+        self.chat_history: List[ChatMessage] = []
+        self.ollama_client: Optional[OllamaClient] = None
+        self.ollama_model_var: Optional[tk.StringVar] = None
+        self.ollama_status_var: Optional[tk.StringVar] = None
+        self.tool_vars: Dict[str, tk.BooleanVar] = {}
+        self.current_streaming_bubble: Optional[tk.Text] = None
+        self.chat_inner_frame: Optional[ttk.Frame] = None
+        self.chat_canvas: Optional[tk.Canvas] = None
+        self.agentic_search_enabled: bool = True
+        self._agent_tools: Set[str] = set()
+        self._waiting_animation_job: Optional[str] = None
+        self._waiting_animation_state: int = 0
+        self._generation_in_progress: bool = False
+        self._stop_generation: bool = False
+        self._load_agent_tools()
+
+    def _load_agent_tools(self):
+        """Load available tools from agent module."""
+        try:
+            # Try to import agent tools dynamically
+            agent_path = os.path.join(os.path.dirname(__file__), 'agent')
+            if agent_path not in sys.path:
+                sys.path.insert(0, agent_path)
+            from agent.main import INTERRUPTING_TAGS
+            self._agent_tools = set(INTERRUPTING_TAGS)
+        except ImportError:
+            # Fallback to default tools if agent module not available
+            self._agent_tools = {'readfile', 'grepsearch', 'filesystem', 'fileinfo', 'textprocess'}
+
+    def _initialize_websocket_state(self):
+        self.websocket_server = None  # type: ignore
+        self.websocket_loop: Optional[asyncio.AbstractEventLoop] = None
+        self.connected_clients = set()
+        # FIXED: Corrected type hint for websockets
+        self.client_info = {}  # type: ignore
+        self.current_shared_string = "File Retrieval GUI is running, but no files have been selected yet."
+        self.websocket_enabled = True
+        self.websocket_start_time: Optional[datetime] = None
+        self.connections_refresh_job: Optional[str] = None
+        self.websocket_host = WEBSOCKET_HOST
+        self.websocket_port = WEBSOCKET_PORT
+        self.actual_websocket_port: Optional[int] = None
+
+    def _start_websocket_server(self):
+        if not self.websocket_enabled:
+            self._log_message("WebSocket server is disabled.", "info")
+            return
+        
+        self._cleanup_websocket_state()
+            
+        try:
+            asyncio.run(self._async_websocket_server_main())
+        except OSError as e:
+            self._log_message(f"WebSocket Error: Could not start server. Port {WEBSOCKET_PORT} may be in use. {e}", "error")
+        except Exception as e:
+            self._log_message(f"An unexpected error occurred in the WebSocket server thread: {e}", "error")
+        finally:
+            self._cleanup_websocket_state()
+
+    async def _async_websocket_server_main(self):
+        self.websocket_loop = asyncio.get_running_loop()
+        server_started = False
+        last_error = None
+        
+        ports_to_try = list(dict.fromkeys([self.websocket_port] + list(range(WEBSOCKET_PORT_RANGE_START, WEBSOCKET_PORT_RANGE_END + 1))))
+        
+        for port in ports_to_try:
+            try:
+                self._log_message(f"Attempting to start WebSocket server on {self.websocket_host}:{port}")
+                self.websocket_server = await websockets.serve(self._websocket_handler, self.websocket_host, port)
+                self.actual_websocket_port = port
+                self.websocket_start_time = datetime.now()
+                self._log_message(f"WebSocket server started successfully on ws://{self.websocket_host}:{port}", "success")
+                if port != self.websocket_port:
+                    self._log_message(f"Note: Using port {port} instead of configured port {self.websocket_port}", "info")
+                self._save_websocket_config()
+                server_started = True
+                break
+            except OSError as e:
+                last_error = e
+                self._log_message(f"Port {port} unavailable, trying next port...", "warning")
+        
+        if not server_started:
+            error_msg = f"Could not start WebSocket server on any port in range {WEBSOCKET_PORT_RANGE_START}-{WEBSOCKET_PORT_RANGE_END}"
+            if last_error:
+                error_msg += f". Last error: {last_error}"
+            raise OSError(error_msg)
+        
+        assert self.websocket_server is not None
+        await self.websocket_server.wait_closed()
+
+    # FIXED: Corrected type hint for websockets
+    async def _websocket_handler(self, websocket):  # type: ignore
+        client_address = f"{websocket.remote_address[0]}:{websocket.remote_address[1]}" if websocket.remote_address else "unknown"
+        connect_time = datetime.now()
+        
+        self.connected_clients.add(websocket)
+        self.client_info[websocket] = {
+            'address': client_address,
+            'connect_time': connect_time,
+            'last_activity': connect_time
+        }
+        
+        self._log_message(f"New client connected from {client_address} ({len(self.connected_clients)} total).", "info")
+        try:
+            await websocket.send(self.current_shared_string)
+            async for message in websocket:
+                if websocket in self.client_info:
+                    self.client_info[websocket]['last_activity'] = datetime.now()
+                # Process incoming messages for agentic search
+                await self._process_websocket_message(message, websocket)
+        except websockets.exceptions.ConnectionClosed:
+            self._log_message(f"Client {client_address} connection closed.", "info")
+        except Exception as e:
+            self._log_message(f"Error with client {client_address}: {e}", "error")
+        finally:
+            self.connected_clients.discard(websocket)
+            if websocket in self.client_info:
+                del self.client_info[websocket]
+            self._log_message(f"Client {client_address} removed ({len(self.connected_clients)} total).", "info")
+
+    async def _broadcast_update(self):
+        if not self.connected_clients:
+            return
+        
+        clients_to_send = list(self.connected_clients)
+        message = self.current_shared_string
+        
+        tasks = [client.send(message) for client in clients_to_send]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        failed_clients = [clients_to_send[i] for i, res in enumerate(results) if isinstance(res, Exception)]
+        for client in failed_clients:
+            self.connected_clients.discard(client)
+        
+        if len(clients_to_send) > len(failed_clients):
+             self._log_message(f"Broadcasted update to {len(clients_to_send) - len(failed_clients)} client(s).")
+
+    async def _process_websocket_message(self, message: str, websocket):
+        """Handle incoming WebSocket messages for agentic search."""
+        try:
+            data = json.loads(message)
+            msg_type = data.get("type")
+
+            if msg_type == "agentic_search_query":
+                # Inject query into chat from external client
+                query = data.get("query", "")
+                self.root.after(0, lambda: self._inject_external_query(query))
+
+            elif msg_type == "agentic_search_response":
+                # External service sending a response to display
+                response = data.get("response", "")
+                self.root.after(0, lambda: self._inject_external_response(response))
+
+            elif msg_type == "get_status":
+                # Return current status
+                status = {
+                    "type": "status_response",
+                    "ollama_connected": self.ollama_client.is_available() if self.ollama_client else False,
+                    "model": self.ollama_model_var.get() if self.ollama_model_var else None,
+                    "chat_history_length": len(self.chat_history),
+                    "enabled_tools": [t for t, var in self.tool_vars.items() if var.get()]
+                }
+                await websocket.send(json.dumps(status))
+
+        except json.JSONDecodeError:
+            # Not a JSON message, ignore (could be legacy format)
+            pass
+        except Exception as e:
+            self._log_message(f"Error processing WebSocket message: {e}", "error")
+
+    def _get_selected_files_ordered(self) -> List[str]:
+        return [self.selected_files_tree.item(item, "values")[0] for item in self.selected_files_tree.get_children("")]
+
+    def _update_and_broadcast_string(self):
+        selected_files = self._get_selected_files_ordered()
+        if not selected_files and not self.append_filetree_var.get():
+            self.current_shared_string = "No files selected."
+        else:
+            self.current_shared_string = build_clipboard_content(
+                [os.path.join(self.directory, f) for f in selected_files],
+                self.directory,
+                append_tree=self.append_filetree_var.get(),
+                exclusion_regex=self._get_exclusion_regex()
+            )
+        self._safe_broadcast_update()
+
+    def _update_ui_state(self, auto_save: bool = True):
+        self.update_selected_count()
+        self.update_preview()
+        if auto_save:
+            self._debounce_auto_save()
+        self._update_and_broadcast_string()
+
+    def on_closing(self):
+        self.auto_save_current_preset()
+        if self.connections_refresh_job:
+            self.root.after_cancel(self.connections_refresh_job)
+        if self.websocket_server:
+            self._log_message("Stopping WebSocket server...")
+            self._stop_websocket_server()
+        self.root.destroy()
+        
+    def update_preview(self):
+        if not self.preview_visible:
+            return
+        self.preview_text.config(state=tk.NORMAL)
+        self.preview_text.delete(1.0, tk.END)
+        out = self.current_shared_string
+        self.preview_text.insert(1.0, out)
+        
+        if out == "No files selected.":
+            self.preview_stats_var.set("L: 0 | C: 0")
+        else:
+            self.preview_stats_var.set(f"L: {len(out.splitlines()):,} | C: {len(out):,}")
+        self.preview_text.see(1.0)
+        self.preview_text.config(state=tk.DISABLED)
+
+    def _setup_styles(self):
+        self.root.title(f"File Retrieval GUI - {os.path.basename(self.directory)}")
+
+        # Set window class for proper taskbar identification
+        try:
+            self.root.tk.call('wm', 'class', self.root._w, 'FileRetrievalGUI')
+        except Exception:
+            pass
+
+        # Set window icon - load multiple resolutions for crisp display
+        icon_png_path = os.path.join(get_script_directory(), "assets", "Icon.png")
+
+        if os.path.exists(icon_png_path) and Image and ImageTk:
+            try:
+                # Load original PNG
+                original = Image.open(icon_png_path)
+
+                # Crop transparent padding to make icon larger in taskbar
+                if original.mode == 'RGBA':
+                    # Get bounding box of non-transparent content
+                    bbox = original.getbbox()
+                    if bbox:
+                        original = original.crop(bbox)
+
+                # Provide full range of icon sizes - taskbar picks what it needs
+                # Most taskbars use 32-64px, but we provide more for flexibility
+                icon_sizes = [256, 128, 96, 64, 48, 32, 24, 16]
+                icon_images = []
+
+                for size in icon_sizes:
+                    # Maintain aspect ratio by fitting into square canvas
+                    img_copy = original.copy()
+                    img_copy.thumbnail((size, size), Image.Resampling.LANCZOS)
+
+                    # Create square transparent canvas
+                    square_img = Image.new('RGBA', (size, size), (0, 0, 0, 0))
+
+                    # Center the icon on the canvas
+                    offset = ((size - img_copy.width) // 2, (size - img_copy.height) // 2)
+                    square_img.paste(img_copy, offset, img_copy if img_copy.mode == 'RGBA' else None)
+
+                    photo = ImageTk.PhotoImage(square_img)
+                    icon_images.append(photo)
+
+                # Pass all sizes to iconphoto (first arg True = apply to future windows too)
+                self.root.iconphoto(True, *icon_images)
+
+                # Keep references to prevent garbage collection
+                self.icon_images = icon_images
+            except Exception as e:
+                print(f"Warning: Could not load icon: {e}")
+
+        self.root.geometry("1400x900")
+        self.root.configure(bg=DARK_BG)
+        style = ttk.Style()
+        base_font = ("Segoe UI", 10) if sys.platform == "win32" else ("Helvetica", 11)
+
+        style.theme_use('clam')
+
+        self.root.option_add('*TCombobox*Listbox.background', DARK_ENTRY_BG)
+        self.root.option_add('*TCombobox*Listbox.foreground', DARK_FG)
+        self.root.option_add('*TCombobox*Listbox.selectBackground', DARK_SELECT_BG)
+        self.root.option_add('*TCombobox*Listbox.selectForeground', DARK_FG)
+        self.root.option_add('*TCombobox*Listbox.font', base_font)
+        self.root.option_add('*TCombobox*Listbox.selectBorderWidth', '0')
+
+        style.configure('.', font=base_font, background=DARK_BG, foreground=DARK_FG)
+        style.configure("TFrame", background=DARK_BG)
+        style.configure("TLabel", background=DARK_BG, foreground=DARK_FG)
+
+        style.configure("TCombobox", fieldbackground=DARK_ENTRY_BG, background=DARK_ENTRY_BG, foreground=DARK_FG, bordercolor=DARK_SELECT_BG, insertcolor=DARK_FG, arrowcolor=DARK_FG)
+        style.map("TCombobox", foreground=[('readonly', DARK_FG)], fieldbackground=[('readonly', DARK_ENTRY_BG)], background=[('readonly', DARK_ENTRY_BG)])
+        
+        style.configure("TEntry", fieldbackground=DARK_ENTRY_BG, background=DARK_ENTRY_BG, foreground=DARK_FG, bordercolor=DARK_SELECT_BG, insertcolor=DARK_FG)
+        style.configure("TButton", background=DARK_BUTTON_BG, foreground=DARK_FG, bordercolor=DARK_SELECT_BG, padding=5)
+        style.configure("Treeview", background=DARK_TREE_BG, foreground=DARK_FG, fieldbackground=DARK_TREE_BG, rowheight=25)
+        style.map("Treeview", background=[('selected', DARK_SELECT_BG)])
+        style.configure("TCheckbutton", background=DARK_BG, foreground=DARK_FG)
+        style.configure('Accent.TButton', font=(base_font[0], base_font[1], "bold"), background="#0078d4", foreground=DARK_FG)
+        style.map('Accent.TButton', background=[('active', '#106ebe')])
+        style.configure('Danger.TButton', font=(base_font[0], base_font[1], "bold"), background="#d32f2f", foreground=DARK_FG)
+        style.map('Danger.TButton', background=[('active', '#b71c1c')])
+        style.configure("Small.TButton", font=(base_font[0], base_font[1] - 2), padding=1)
+        style.configure("TNotebook", background=DARK_BG, borderwidth=0)
+        style.configure("TNotebook.Tab", background=DARK_BUTTON_BG, foreground=DARK_FG, padding=[8, 4])
+        style.map("TNotebook.Tab", background=[("selected", DARK_SELECT_BG)], expand=[("selected", [1, 1, 1, 0])])
+
+    def _create_widgets(self):
+        self.main_container = ttk.Frame(self.root, padding=10)
+        self.main_container.pack(fill=tk.BOTH, expand=True)
+
+        # Create bottom controls frame first so it stays visible
+        bottom_controls_frame = ttk.Frame(self.main_container)
+        bottom_controls_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=(10, 0))
+
+        self.preview_frame = ttk.Frame(self.main_container)
+
+        self.vertical_pane = ttk.PanedWindow(self.main_container, orient=tk.VERTICAL)
+        self.vertical_pane.pack(fill=tk.BOTH, expand=True)
+
+        self.top_pane = ttk.PanedWindow(self.vertical_pane, orient=tk.HORIZONTAL)
+        self.vertical_pane.add(self.top_pane, weight=4)
+        bottom_pane_container = ttk.Frame(self.vertical_pane)
+        self.vertical_pane.add(bottom_pane_container, weight=2)
+
+        self._create_tree_pane()
+        self._create_selection_pane()
+        self._create_bottom_notebook(bottom_pane_container)
+
+        self.btn_toggle_preview = ttk.Button(bottom_controls_frame, text="Show Preview", command=self.toggle_preview)
+        self.btn_toggle_preview.pack(side=tk.LEFT)
+
+        self.btn_copy = ttk.Button(bottom_controls_frame, text="Copy to Clipboard", command=self.copy_to_clipboard, style='Accent.TButton')
+        self.btn_copy.pack(side=tk.RIGHT)
+
+        # New label for "Copied!" notification - packed to the RIGHT (so it appears left of the copy button)
+        self.copied_label = ttk.Label(bottom_controls_frame, text="", foreground="#4CAF50", font=("Segoe UI", 10, "bold"))
+        self.copied_label.pack(side=tk.RIGHT, padx=(0, 10))
+
+        # Right-aligned checkbox
+        self.chk_append_tree = ttk.Checkbutton(bottom_controls_frame, text="Append Filetree", variable=self.append_filetree_var, command=self._update_ui_state)
+        self.chk_append_tree.pack(side=tk.RIGHT, padx=(0, 20))
+
+        self._create_preview_widgets()
+
+    def _create_tree_pane(self, *args):
+        tree_frame = ttk.Frame(self.top_pane, padding=(0, 0, 5, 0))
+        search_frame = ttk.Frame(tree_frame)
+        search_frame.pack(fill=tk.X, pady=(0, 5))
+        ttk.Label(search_frame, text="Filter:").pack(side=tk.LEFT)
+        self.search_var = tk.StringVar()
+        self.search_entry = ttk.Entry(search_frame, textvariable=self.search_var)
+        self.search_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        exclusion_main_frame = ttk.Frame(tree_frame)
+        exclusion_main_frame.pack(fill=tk.X, pady=(0, 10))
+        checkbox_frame = ttk.Frame(exclusion_main_frame)
+        checkbox_frame.pack(anchor='w')
+        self.advanced_exclude_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(checkbox_frame, text="Advanced Exclusions (Regex)", variable=self.advanced_exclude_var, command=self._toggle_exclude_mode).pack(side=tk.LEFT)
+        self.use_gitignore_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(checkbox_frame, text="Use .gitignore", variable=self.use_gitignore_var).pack(side=tk.LEFT, padx=(10, 0))
+        self.simple_exclude_frame = ttk.Frame(exclusion_main_frame)
+        ttk.Label(self.simple_exclude_frame, text="Exclude Dirs:").grid(row=0, column=0, sticky='w', pady=(5, 0))
+        self.exclude_dirs_var = tk.StringVar(value=get_default_exclude_dirs())
+        self.exclude_dirs_entry = ttk.Entry(self.simple_exclude_frame, textvariable=self.exclude_dirs_var)
+        self.exclude_dirs_entry.grid(row=0, column=1, sticky='ew', pady=(5, 0), padx=(5, 0))
+        ttk.Label(self.simple_exclude_frame, text="Exclude Files:").grid(row=1, column=0, sticky='w')
+        self.exclude_patterns_var = tk.StringVar(value="*.log *.json *.csv *.env .DS_Store .gitignore")
+        self.exclude_patterns_entry = ttk.Entry(self.simple_exclude_frame, textvariable=self.exclude_patterns_var)
+        self.exclude_patterns_entry.grid(row=1, column=1, sticky='ew', padx=(5, 0))
+        self.simple_exclude_frame.grid_columnconfigure(1, weight=1)
+        self.advanced_exclude_frame = ttk.Frame(exclusion_main_frame)
+        ttk.Label(self.advanced_exclude_frame, text="Exclude (regex):").pack(side=tk.LEFT)
+        self.exclusion_var = tk.StringVar(value=get_default_advanced_exclusion_regex())
+        self.exclusion_entry = ttk.Entry(self.advanced_exclude_frame, textvariable=self.exclusion_var)
+        self.exclusion_entry.pack(fill=tk.X, expand=True)
+        tree_controls = ttk.Frame(tree_frame)
+        tree_controls.pack(fill=tk.X, pady=(0, 5))
+        ttk.Button(tree_controls, text="Add Folder", command=self.add_selected_folder).pack(side=tk.LEFT)
+        ttk.Button(tree_controls, text="Add All Visible", command=self.add_all_visible_files).pack(side=tk.LEFT, padx=5)
+        ttk.Button(tree_controls, text="Expand All", command=self.expand_all_tree_items).pack(side=tk.LEFT)
+        ttk.Button(tree_controls, text="Collapse All", command=self.collapse_all_tree_items).pack(side=tk.LEFT, padx=5)
+        self.tree = ttk.Treeview(tree_frame, show="tree headings")
+        self.tree.heading("#0", text="Project Structure", anchor='w')
+        ysb = ttk.Scrollbar(tree_frame, orient='vertical', command=self.tree.yview)
+        self.tree.configure(yscrollcommand=ysb.set)
+        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        ysb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.top_pane.add(tree_frame, weight=2)
+        self.tree.insert("", "end", text="Scanning project...", tags=('info',))
+        self.tree.tag_configure('info', foreground='#888888')
+
+    def _create_selection_pane(self, *args):
+        selection_frame = ttk.Frame(self.top_pane, padding=(5, 0, 0, 0))
+        preset_frame = ttk.Frame(selection_frame)
+        preset_frame.pack(fill=tk.X, pady=(0, 15))
+        ttk.Label(preset_frame, text="Preset:").pack(side=tk.LEFT)
+        self.preset_var = tk.StringVar()
+        self.preset_combobox = ttk.Combobox(preset_frame, textvariable=self.preset_var, state="readonly")
+        self.preset_combobox.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        ttk.Button(preset_frame, text="Save As...", command=self.save_current_as_preset, width=10).pack(side=tk.LEFT)
+        ttk.Button(preset_frame, text="Remove", command=self.remove_selected_preset, width=8).pack(side=tk.LEFT, padx=5)
+        ttk.Label(selection_frame, text="Selected Files (Drag to Reorder)", font=("Segoe UI", 10, "bold")).pack(pady=(0, 5), anchor='w')
+
+        # Create controls frame first to ensure it reserves space at the bottom
+        controls_frame = ttk.Frame(selection_frame)
+        controls_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=5)
+        ttk.Button(controls_frame, text="Remove Selected", command=self.remove_selected).pack(side=tk.LEFT)
+        ttk.Button(controls_frame, text="Clear All", command=self.clear_all).pack(side=tk.LEFT, padx=5)
+        self.selected_count_var = tk.StringVar(value="0 files selected")
+        ttk.Label(controls_frame, textvariable=self.selected_count_var).pack(side=tk.RIGHT)
+
+        selection_tree_frame = ttk.Frame(selection_frame)
+        selection_tree_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        selection_tree_frame.grid_rowconfigure(0, weight=1)
+        selection_tree_frame.grid_columnconfigure(0, weight=1)
+
+        self.selected_files_tree = ttk.Treeview(selection_tree_frame, columns=("filepath", "filetype", "filesize", "char_count", "changed"), show="headings", selectmode="extended")
+        self.selected_files_tree.heading("filepath", text="File Path")
+        self.selected_files_tree.heading("filetype", text="Type", anchor='center')
+        self.selected_files_tree.heading("filesize", text="Size", anchor='e')
+        self.selected_files_tree.heading("char_count", text="Characters", anchor='e')
+        self.selected_files_tree.heading("changed", text="Modified", anchor='e')
+        self.selected_files_tree.column("filepath", width=250, stretch=tk.YES)
+        self.selected_files_tree.column("filetype", width=60, stretch=tk.NO, anchor='center')
+        self.selected_files_tree.column("filesize", width=80, stretch=tk.NO, anchor='e')
+        self.selected_files_tree.column("char_count", width=100, stretch=tk.NO, anchor='e')
+        self.selected_files_tree.column("changed", width=140, stretch=tk.NO, anchor='e')
+        
+        self.selected_files_tree.tag_configure('unsupported', foreground=DARK_ERROR_FG)
+
+        tree_scrollbar = ttk.Scrollbar(selection_tree_frame, orient='vertical', command=self.selected_files_tree.yview)
+        self.selected_files_tree.configure(yscrollcommand=tree_scrollbar.set)
+
+        self.selected_files_tree.grid(row=0, column=0, sticky="nsew")
+        tree_scrollbar.grid(row=0, column=1, sticky="ns")
+
+        # Set focus to enable keyboard shortcuts
+        self.selected_files_tree.focus_set()
+
+        # Controls moved to top of function to ensure visibility
+        self.top_pane.add(selection_frame, weight=3)
+
+    def _create_bottom_notebook(self, parent):
+        notebook = ttk.Notebook(parent)
+        notebook.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
+        tools_tab = ttk.Frame(notebook, padding=5)
+        notebook.add(tools_tab, text="Tools")
+        self._create_tools_pane(tools_tab)
+        log_tab = ttk.Frame(notebook, padding=5)
+        notebook.add(log_tab, text="Log")
+        self._create_log_pane(log_tab)
+        connections_tab = ttk.Frame(notebook, padding=5)
+        notebook.add(connections_tab, text="Connections")
+        self._create_connections_pane(connections_tab)
+        agentic_search_tab = ttk.Frame(notebook, padding=5)
+        notebook.add(agentic_search_tab, text="Agentic Search")
+        self._create_agentic_search_pane(agentic_search_tab)
+
+    def _create_tools_pane(self, parent):
+        tools_container = ttk.Frame(parent)
+        tools_container.pack(fill=tk.BOTH, expand=True)
+
+        smart_paster_frame = ttk.Frame(tools_container)
+        smart_paster_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 5))
+
+        ttk.Label(smart_paster_frame, text="Filepath Extractor", font=("Segoe UI", 10, "bold")).pack(anchor='w')
+
+        # Pack controls at bottom first
+        smart_paster_controls = ttk.Frame(smart_paster_frame)
+        smart_paster_controls.pack(side=tk.BOTTOM, fill=tk.X, pady=(0, 5))
+        ttk.Button(smart_paster_controls, text="Find & Select Files", command=self._initiate_smart_paste, style='Accent.TButton').pack(side=tk.LEFT)
+        self.smart_paste_status = ttk.Label(smart_paster_controls, text="", font=("Segoe UI", 9))
+        self.smart_paste_status.pack(side=tk.LEFT, padx=(10, 0))
+
+        self.smart_paste_text = scrolledtext.ScrolledText(smart_paster_frame, height=4, wrap=tk.WORD, bg=DARK_ENTRY_BG, fg=DARK_FG, insertbackground=DARK_FG, font=("Segoe UI", 10), borderwidth=0, highlightthickness=1)
+        self.smart_paste_text.pack(side=tk.TOP, fill=tk.BOTH, expand=True, pady=5)
+
+        # Ensure text widget gets focus on click
+        self.smart_paste_text.bind("<Button-1>", lambda e: self.smart_paste_text.focus_set() or None)
+
+        # Enable Ctrl+A to select all
+        def select_all_smart_paste(event):
+            self.smart_paste_text.tag_add(tk.SEL, "1.0", tk.END)
+            self.smart_paste_text.mark_set(tk.INSERT, "1.0")
+            self.smart_paste_text.see(tk.INSERT)
+            return "break"
+        self.smart_paste_text.bind("<Control-a>", select_all_smart_paste)
+
+        apply_changes_frame = ttk.Frame(tools_container)
+        apply_changes_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(5, 0))
+
+        apply_header_row = ttk.Frame(apply_changes_frame)
+        apply_header_row.pack(fill=tk.X)
+
+        ttk.Label(apply_header_row, text="Apply Changes to Files", font=("Segoe UI", 10, "bold")).pack(side=tk.LEFT)
+        ttk.Button(apply_header_row, text="Copy Usage Instruction", style="Small.TButton", command=self._copy_usage_instruction).pack(side=tk.LEFT, padx=(10, 0))
+
+        # Pack controls at bottom first
+        apply_changes_controls = ttk.Frame(apply_changes_frame)
+        apply_changes_controls.pack(side=tk.BOTTOM, fill=tk.X, pady=(0, 5))
+        ttk.Button(apply_changes_controls, text="Preview Changes", command=self._initiate_preview_changes).pack(side=tk.LEFT)
+        ttk.Button(apply_changes_controls, text="Apply to Files", command=self._initiate_apply_changes, style='Accent.TButton').pack(side=tk.LEFT, padx=(5, 0))
+
+        self.apply_changes_text = scrolledtext.ScrolledText(apply_changes_frame, height=4, wrap=tk.WORD, bg=DARK_ENTRY_BG, fg=DARK_FG, insertbackground=DARK_FG, font=("Segoe UI", 10), borderwidth=0, highlightthickness=1)
+        self.apply_changes_text.pack(side=tk.TOP, fill=tk.BOTH, expand=True, pady=5)
+
+        # Enable Ctrl+A to select all
+        def select_all_apply_changes(event):
+            self.apply_changes_text.tag_add(tk.SEL, "1.0", tk.END)
+            self.apply_changes_text.mark_set(tk.INSERT, "1.0")
+            self.apply_changes_text.see(tk.INSERT)
+            return "break"
+        self.apply_changes_text.bind("<Control-a>", select_all_apply_changes)
+
+        # Undo/Redo buttons
+        self.btn_undo = ttk.Button(apply_changes_controls, text="Undo", command=self._initiate_undo, width=8)
+        self.btn_undo.pack(side=tk.LEFT, padx=(10, 0))
+        self.btn_undo.state(['disabled'])
+
+        self.btn_redo = ttk.Button(apply_changes_controls, text="Redo", command=self._initiate_redo, width=8)
+        self.btn_redo.pack(side=tk.LEFT, padx=(5, 0))
+        self.btn_redo.state(['disabled'])
+
+        # History label showing position
+        self.history_label = ttk.Label(apply_changes_controls, text="", font=("Segoe UI", 9))
+        self.history_label.pack(side=tk.LEFT, padx=(10, 0))
+
+        self.apply_status_label = ttk.Label(apply_changes_controls, text="", foreground="#4CAF50", font=("Segoe UI", 10, "bold"))
+        self.apply_status_label.pack(side=tk.LEFT, padx=(10, 0))
+
+    def _create_log_pane(self, parent):
+        ttk.Label(parent, text="Global Log", font=("Segoe UI", 10, "bold")).pack(anchor='w', pady=(5, 2))
+        self.log_text = scrolledtext.ScrolledText(parent, height=5, wrap=tk.WORD, bg=DARK_ENTRY_BG, fg=DARK_FG, font=("Consolas", 9), borderwidth=0, highlightthickness=1)
+        self.log_text.pack(fill=tk.BOTH, expand=True)
+        self.log_text.tag_config("success", foreground="#4CAF50")
+        self.log_text.tag_config("error", foreground="#F44336")
+        self.log_text.tag_config("info", foreground="#FFFFFF")
+        self.log_text.tag_config("warning", foreground="#FFC107")
+        self.log_text.config(state=tk.DISABLED)
+
+        # Enable Ctrl+A to select all
+        def select_all_log(event):
+            self.log_text.tag_add(tk.SEL, "1.0", tk.END)
+            self.log_text.mark_set(tk.INSERT, "1.0")
+            self.log_text.see(tk.INSERT)
+            return "break"
+        self.log_text.bind("<Control-a>", select_all_log)
+    
+    def _create_connections_pane(self, parent):
+        connections_container = ttk.Frame(parent)
+        connections_container.pack(fill=tk.BOTH, expand=True)
+        
+        status_frame = ttk.Frame(connections_container)
+        status_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 5))
+        
+        ttk.Label(status_frame, text="WebSocket Server Status", font=("Segoe UI", 10, "bold")).pack(anchor='w', pady=(0, 5))
+
+        # Pack controls at bottom first
+        controls_frame = ttk.Frame(status_frame)
+        controls_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=(0, 10))
+
+        self.btn_toggle_server = ttk.Button(controls_frame, text="Disable Server", command=self.toggle_websocket_server)
+        self.btn_toggle_server.pack(side=tk.LEFT, padx=(0, 5))
+
+        self.btn_restart_server = ttk.Button(controls_frame, text="Restart Server", command=self.restart_websocket_server)
+        self.btn_restart_server.pack(side=tk.LEFT, padx=(0, 5))
+
+        self.btn_disconnect_all = ttk.Button(controls_frame, text="Disconnect All", command=self.disconnect_all_clients)
+        self.btn_disconnect_all.pack(side=tk.LEFT)
+
+        # Pack info frame in remaining space
+        status_info_frame = ttk.Frame(status_frame)
+        status_info_frame.pack(side=tk.TOP, fill=tk.X, pady=(0, 10))
+
+        self.server_status_var = tk.StringVar(value="Stopped")
+        self.server_port_var = tk.StringVar(value=f"Port: {WEBSOCKET_PORT}")
+        self.server_uptime_var = tk.StringVar(value="Uptime: --")
+        self.client_count_var = tk.StringVar(value="Connected: 0")
+
+        ttk.Label(status_info_frame, text="Status:").grid(row=0, column=0, sticky='w')
+        self.status_label = ttk.Label(status_info_frame, textvariable=self.server_status_var, foreground="#F44336")
+        self.status_label.grid(row=0, column=1, sticky='w', padx=(5, 0))
+
+        ttk.Label(status_info_frame, textvariable=self.server_port_var).grid(row=1, column=0, columnspan=2, sticky='w')
+        ttk.Label(status_info_frame, textvariable=self.server_uptime_var).grid(row=2, column=0, columnspan=2, sticky='w')
+        ttk.Label(status_info_frame, textvariable=self.client_count_var).grid(row=3, column=0, columnspan=2, sticky='w')
+        
+        clients_frame = ttk.Frame(connections_container)
+        clients_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(5, 0))
+        
+        ttk.Label(clients_frame, text="Connected Clients", font=("Segoe UI", 10, "bold")).pack(anchor='w', pady=(0, 5))
+        
+        clients_list_frame = ttk.Frame(clients_frame)
+        clients_list_frame.pack(fill=tk.BOTH, expand=True)
+        
+        self.clients_listbox = tk.Listbox(clients_list_frame, bg=DARK_ENTRY_BG, fg=DARK_FG, selectbackground=DARK_SELECT_BG, 
+                                         font=("Consolas", 9), highlightthickness=0, borderwidth=0)
+        clients_scrollbar = ttk.Scrollbar(clients_list_frame, orient='vertical', command=self.clients_listbox.yview)
+        self.clients_listbox.configure(yscrollcommand=clients_scrollbar.set, exportselection=False)
+        
+        self.clients_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        clients_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        self._refresh_connections_display()
+
+    def _create_agentic_search_pane(self, parent):
+        """Create the Agentic Search chat interface tab."""
+        main_container = ttk.Frame(parent)
+        main_container.pack(fill=tk.BOTH, expand=True)
+
+        # === HEADER TOOLBAR ===
+        self._create_agentic_header(main_container)
+
+        # === CHAT DISPLAY AREA ===
+        self._create_chat_display(main_container)
+
+        # === INPUT AREA ===
+        self._create_chat_input(main_container)
+
+        # Initialize Ollama client and refresh models
+        self.ollama_client = OllamaClient()
+        self.root.after(500, self._refresh_ollama_models)
+
+    def _create_agentic_header(self, parent):
+        """Create header with model selector and tool checkboxes."""
+        header_frame = ttk.Frame(parent)
+        header_frame.pack(fill=tk.X, pady=(0, 5))
+
+        # Model selector
+        ttk.Label(header_frame, text="Model:").pack(side=tk.LEFT)
+        self.ollama_model_var = tk.StringVar()
+        self.ollama_model_combo = ttk.Combobox(
+            header_frame,
+            textvariable=self.ollama_model_var,
+            state="readonly",
+            width=25
+        )
+        self.ollama_model_combo.pack(side=tk.LEFT, padx=(5, 10))
+
+        # Refresh models button
+        ttk.Button(header_frame, text="Refresh", command=self._refresh_ollama_models).pack(side=tk.LEFT, padx=(0, 15))
+
+        # Tool checkboxes frame with scrollable area
+        tools_label = ttk.Label(header_frame, text="Tools:")
+        tools_label.pack(side=tk.LEFT)
+
+        self.tool_checkboxes_frame = ttk.Frame(header_frame)
+        self.tool_checkboxes_frame.pack(side=tk.LEFT, padx=5)
+
+        # Populate tool checkboxes
+        self._populate_tool_checkboxes()
+
+        # Ollama status indicator
+        self.ollama_status_var = tk.StringVar(value="Checking...")
+        self.ollama_status_label = ttk.Label(header_frame, textvariable=self.ollama_status_var, foreground="#FFC107")
+        self.ollama_status_label.pack(side=tk.RIGHT)
+
+    def _populate_tool_checkboxes(self):
+        """Populate checkboxes for available agent tools."""
+        for widget in self.tool_checkboxes_frame.winfo_children():
+            widget.destroy()
+
+        self.tool_vars.clear()
+        for tool in sorted(self._agent_tools):
+            var = tk.BooleanVar(value=True)  # All enabled by default
+            self.tool_vars[tool] = var
+            cb = ttk.Checkbutton(self.tool_checkboxes_frame, text=tool, variable=var)
+            cb.pack(side=tk.LEFT, padx=2)
+
+    def _create_chat_display(self, parent):
+        """Create scrollable chat display with bubble messages."""
+        chat_container = ttk.Frame(parent)
+        chat_container.pack(fill=tk.BOTH, expand=True, pady=5)
+
+        # Use Canvas with scrollbar for custom bubble rendering
+        self.chat_canvas = tk.Canvas(
+            chat_container,
+            bg=DARK_BG,
+            highlightthickness=0
+        )
+        chat_scrollbar = ttk.Scrollbar(chat_container, orient="vertical", command=self.chat_canvas.yview)
+
+        self.chat_inner_frame = ttk.Frame(self.chat_canvas)
+        self.chat_canvas_window = self.chat_canvas.create_window((0, 0), window=self.chat_inner_frame, anchor="nw", tags="inner")
+
+        self.chat_canvas.configure(yscrollcommand=chat_scrollbar.set)
+
+        chat_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.chat_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        # Bind resize events
+        self.chat_inner_frame.bind("<Configure>", self._on_chat_frame_configure)
+        self.chat_canvas.bind("<Configure>", self._on_chat_canvas_configure)
+
+        # Bind mousewheel for scrolling
+        self.chat_canvas.bind("<MouseWheel>", self._on_chat_mousewheel)
+        self.chat_canvas.bind("<Button-4>", self._on_chat_mousewheel)
+        self.chat_canvas.bind("<Button-5>", self._on_chat_mousewheel)
+
+    def _on_chat_frame_configure(self, event):
+        """Update scroll region when inner frame changes size."""
+        self.chat_canvas.configure(scrollregion=self.chat_canvas.bbox("all"))
+
+    def _on_chat_canvas_configure(self, event):
+        """Update inner frame width when canvas resizes."""
+        self.chat_canvas.itemconfig(self.chat_canvas_window, width=event.width)
+
+    def _on_chat_mousewheel(self, event):
+        """Handle mouse wheel scrolling in chat."""
+        if event.num == 4 or event.delta > 0:
+            self.chat_canvas.yview_scroll(-1, "units")
+        elif event.num == 5 or event.delta < 0:
+            self.chat_canvas.yview_scroll(1, "units")
+
+    def _create_chat_input(self, parent):
+        """Create input text area with Send button."""
+        input_frame = ttk.Frame(parent)
+        input_frame.pack(fill=tk.X, pady=(5, 0))
+
+        # Multi-line input with ScrolledText
+        self.chat_input = scrolledtext.ScrolledText(
+            input_frame,
+            height=3,
+            wrap=tk.WORD,
+            bg=DARK_ENTRY_BG,
+            fg=DARK_FG,
+            insertbackground=DARK_FG,
+            font=("Segoe UI", 10),
+            borderwidth=0,
+            highlightthickness=1
+        )
+        self.chat_input.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        # Bind Enter for send (Shift+Enter for newline)
+        self.chat_input.bind("<Return>", self._on_chat_enter)
+        self.chat_input.bind("<Shift-Return>", lambda e: None)  # Allow newline
+
+        # Enable Ctrl+A to select all
+        def select_all_chat(event):
+            self.chat_input.tag_add(tk.SEL, "1.0", tk.END)
+            self.chat_input.mark_set(tk.INSERT, "1.0")
+            self.chat_input.see(tk.INSERT)
+            return "break"
+        self.chat_input.bind("<Control-a>", select_all_chat)
+
+        # Button container
+        btn_frame = ttk.Frame(input_frame)
+        btn_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=(5, 0))
+
+        # Send/Stop button
+        self.btn_send_chat = ttk.Button(
+            btn_frame,
+            text="Send",
+            command=self._on_send_stop_click,
+            style='Accent.TButton'
+        )
+        self.btn_send_chat.pack(side=tk.TOP, pady=(0, 2))
+
+        # Clear chat button
+        ttk.Button(btn_frame, text="Clear", command=self._clear_chat).pack(side=tk.TOP)
+
+    def _on_chat_enter(self, event):
+        """Handle Enter key in chat input."""
+        if not event.state & 0x1:  # Not Shift+Enter
+            self._send_chat_message()
+            return "break"  # Prevent newline
+        return None
+
+    def _add_chat_bubble(self, message: ChatMessage, is_streaming: bool = False) -> Optional[tk.Text]:
+        """Add a styled message bubble to the chat display."""
+        is_user = message.role == MessageRole.USER
+
+        # Container frame for alignment
+        bubble_container = ttk.Frame(self.chat_inner_frame)
+        bubble_container.pack(fill=tk.X, pady=2, padx=5)
+
+        # Bubble frame with background
+        bubble_frame = tk.Frame(
+            bubble_container,
+            bg=BUBBLE_USER_BG if is_user else BUBBLE_AGENT_BG,
+            padx=10,
+            pady=5
+        )
+
+        # Align right for user, left for agent
+        bubble_frame.pack(
+            side=tk.RIGHT if is_user else tk.LEFT,
+            anchor='e' if is_user else 'w'
+        )
+
+        # Timestamp label
+        time_str = message.timestamp.strftime("%H:%M")
+        role_label = "You" if is_user else "Agent"
+        tk.Label(
+            bubble_frame,
+            text=f"{role_label} - {time_str}",
+            bg=BUBBLE_USER_BG if is_user else BUBBLE_AGENT_BG,
+            fg="#aaaaaa",
+            font=("Segoe UI", 8)
+        ).pack(anchor='w')
+
+        # Message text (using tk.Text for word wrap)
+        msg_text = tk.Text(
+            bubble_frame,
+            wrap=tk.WORD,
+            width=60,  # Max width in characters
+            height=1,  # Will auto-adjust
+            bg=BUBBLE_USER_BG if is_user else BUBBLE_AGENT_BG,
+            fg=BUBBLE_USER_FG if is_user else BUBBLE_AGENT_FG,
+            font=("Segoe UI", 10),
+            borderwidth=0,
+            highlightthickness=0,
+            relief=tk.FLAT
+        )
+        msg_text.insert("1.0", message.content)
+
+        # Auto-adjust height based on content
+        line_count = int(msg_text.index('end-1c').split('.')[0])
+        msg_text.config(height=min(max(line_count, 1), 20))
+
+        if not is_streaming:
+            msg_text.config(state=tk.DISABLED)
+
+        msg_text.pack()
+
+        # Enable Ctrl+A to select all
+        msg_text.bind("<Control-a>", lambda e, w=msg_text: (w.tag_add(tk.SEL, "1.0", tk.END), w.mark_set(tk.INSERT, "1.0"), w.see(tk.INSERT), "break")[-1])
+
+        # Scroll to bottom
+        self.chat_canvas.update_idletasks()
+        self.chat_canvas.yview_moveto(1.0)
+
+        return msg_text if is_streaming else None
+
+    def _update_streaming_bubble(self, text_widget: tk.Text, content: str):
+        """Update a streaming bubble with new content."""
+        text_widget.config(state=tk.NORMAL)
+        text_widget.delete("1.0", tk.END)
+        text_widget.insert("1.0", content)
+
+        # Auto-adjust height
+        line_count = int(text_widget.index('end-1c').split('.')[0])
+        text_widget.config(height=min(max(line_count, 1), 20))
+
+        # Scroll to bottom
+        self.chat_canvas.update_idletasks()
+        self.chat_canvas.yview_moveto(1.0)
+
+    def _finalize_streaming_bubble(self, text_widget: tk.Text):
+        """Finalize a streaming bubble (make it read-only)."""
+        text_widget.config(state=tk.DISABLED)
+
+    def _clear_chat(self):
+        """Clear all chat messages."""
+        self._stop_waiting_animation()
+        self.current_streaming_bubble = None
+        self.chat_history.clear()
+        for widget in self.chat_inner_frame.winfo_children():
+            widget.destroy()
+        self._log_message("Chat cleared.", "info")
+
+    # === Ollama Integration Methods ===
+
+    def _refresh_ollama_models(self):
+        """Fetch available models from Ollama API."""
+        def worker():
+            try:
+                if self.ollama_client:
+                    models = self.ollama_client.list_models()
+                    self.root.after(0, lambda: self._update_model_list(models))
+            except Exception as e:
+                self.root.after(0, lambda: self._set_ollama_status("Offline", "#F44336"))
+                self._log_message(f"Ollama connection error: {e}", "error")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _update_model_list(self, models: List[str]):
+        """Update model dropdown with available models."""
+        self.ollama_model_combo['values'] = models
+        if models:
+            self.ollama_model_combo.current(0)
+            self._set_ollama_status("Connected", "#4CAF50")
+            self._log_message(f"Ollama connected. {len(models)} model(s) available.", "success")
+        else:
+            self._set_ollama_status("No models", "#FFC107")
+
+    def _set_ollama_status(self, text: str, color: str):
+        """Update Ollama status indicator."""
+        if self.ollama_status_var:
+            self.ollama_status_var.set(text)
+        if hasattr(self, 'ollama_status_label'):
+            self.ollama_status_label.config(foreground=color)
+
+    def _on_send_stop_click(self):
+        """Handle Send/Stop button click."""
+        if self._generation_in_progress:
+            self._stop_generation_request()
+        else:
+            self._send_chat_message()
+
+    def _stop_generation_request(self):
+        """Request to stop the current generation."""
+        self._stop_generation = True
+        self._log_message("Stopping generation...", "info")
+
+    def _set_generation_state(self, in_progress: bool):
+        """Update UI to reflect generation state."""
+        self._generation_in_progress = in_progress
+        if in_progress:
+            self.btn_send_chat.config(text="Stop", style='Danger.TButton')
+            self._stop_generation = False
+        else:
+            self.btn_send_chat.config(text="Send", style='Accent.TButton')
+            self._stop_generation = False
+
+    def _send_chat_message(self):
+        """Send user message and get agent response."""
+        content = self.chat_input.get("1.0", tk.END).strip()
+        if not content:
+            return
+
+        # Clear input
+        self.chat_input.delete("1.0", tk.END)
+
+        # Add user message
+        user_msg = ChatMessage(role=MessageRole.USER, content=content)
+        self.chat_history.append(user_msg)
+        self._add_chat_bubble(user_msg)
+
+        # Switch to Stop button
+        self._set_generation_state(True)
+
+        # Start async response
+        threading.Thread(target=self._get_agent_response, daemon=True).start()
+
+    def _get_agent_response(self):
+        """Worker thread for getting streaming response from Ollama."""
+        model = self.ollama_model_var.get() if self.ollama_model_var else None
+        if not model:
+            self.root.after(0, lambda: self._log_message("No model selected", "error"))
+            self.root.after(0, lambda: self._set_generation_state(False))
+            return
+
+        # Build messages for API
+        messages = [msg.to_dict() for msg in self.chat_history]
+
+        # Add system prompt with enabled tools
+        enabled_tools = [t for t, var in self.tool_vars.items() if var.get()]
+        system_prompt = self._build_system_prompt(enabled_tools)
+        messages.insert(0, {"role": "system", "content": system_prompt})
+
+        try:
+            # Create placeholder bubble for streaming
+            placeholder_msg = ChatMessage(role=MessageRole.ASSISTANT, content="...")
+            self.root.after(0, lambda: self._create_streaming_bubble(placeholder_msg))
+
+            # Small delay to ensure bubble is created
+            import time
+            time.sleep(0.1)
+
+            # Stream response
+            full_response = ""
+            stopped = False
+            for chunk in self.ollama_client.chat_stream(model, messages):
+                # Check for stop request
+                if self._stop_generation:
+                    stopped = True
+                    full_response += "\n\n[Generation stopped by user]"
+                    break
+                full_response += chunk
+                # Update UI progressively
+                self.root.after(0, lambda r=full_response: self._update_current_streaming(r))
+
+            # Finalize response
+            if stopped:
+                self.root.after(0, lambda r=full_response: self._finalize_stopped_response(r))
+            else:
+                self.root.after(0, lambda: self._finalize_response(full_response))
+
+        except Exception as e:
+            self.root.after(0, lambda: self._log_message(f"Ollama error: {e}", "error"))
+            self.root.after(0, lambda: self._handle_streaming_error(str(e)))
+        finally:
+            self.root.after(0, lambda: self._set_generation_state(False))
+
+    def _create_streaming_bubble(self, message: ChatMessage):
+        """Create a bubble for streaming response."""
+        self.current_streaming_bubble = self._add_chat_bubble(message, is_streaming=True)
+        # Start waiting animation
+        self._start_waiting_animation()
+
+    def _start_waiting_animation(self):
+        """Start the waiting dots animation."""
+        self._waiting_animation_state = 0
+        self._animate_waiting_dots()
+
+    def _animate_waiting_dots(self):
+        """Animate the waiting dots in the streaming bubble."""
+        if self.current_streaming_bubble is None:
+            return
+
+        # Check if we're still in "waiting" state (content is just dots)
+        try:
+            current_content = self.current_streaming_bubble.get("1.0", tk.END).strip()
+            # Only animate if content is still the placeholder dots
+            if current_content in ("...", "..", ".", ""):
+                dots = [".", "..", "..."]
+                self._waiting_animation_state = (self._waiting_animation_state + 1) % len(dots)
+                self._update_streaming_bubble(self.current_streaming_bubble, dots[self._waiting_animation_state])
+                # Schedule next animation frame
+                self._waiting_animation_job = self.root.after(400, self._animate_waiting_dots)
+            else:
+                # Real content arrived, stop animation
+                self._stop_waiting_animation()
+        except tk.TclError:
+            # Widget destroyed
+            self._stop_waiting_animation()
+
+    def _stop_waiting_animation(self):
+        """Stop the waiting dots animation."""
+        if self._waiting_animation_job:
+            self.root.after_cancel(self._waiting_animation_job)
+            self._waiting_animation_job = None
+
+    def _update_current_streaming(self, content: str):
+        """Update the current streaming bubble."""
+        # Stop animation when real content arrives
+        self._stop_waiting_animation()
+        if self.current_streaming_bubble:
+            self._update_streaming_bubble(self.current_streaming_bubble, content)
+
+    def _handle_streaming_error(self, error_msg: str):
+        """Handle error during streaming."""
+        self._stop_waiting_animation()
+        if self.current_streaming_bubble:
+            self._update_streaming_bubble(self.current_streaming_bubble, f"Error: {error_msg}")
+            self._finalize_streaming_bubble(self.current_streaming_bubble)
+        self.current_streaming_bubble = None
+
+    def _build_system_prompt(self, enabled_tools: List[str]) -> str:
+        """Build system prompt with file extraction instructions."""
+        tool_list = ", ".join(enabled_tools) if enabled_tools else "none"
+
+        return f"""You are an AI assistant helping users explore and navigate a codebase.
+
+AVAILABLE TOOLS: {tool_list}
+
+IMPORTANT: When you identify files that are relevant to the user's query, you MUST include them in your response using this exact format:
+[FILES: path/to/file1.py, path/to/file2.js, path/to/file3.txt]
+
+This format allows the GUI to automatically select these files for the user.
+
+Guidelines:
+- Use relative paths from the project root
+- Separate multiple files with commas
+- Place the [FILES: ...] tag at the end of your response
+- Only include files that actually exist and are directly relevant
+- Be concise and helpful in your explanations
+
+Working directory: {self.directory}
+"""
+
+    def _extract_files_from_response(self, response: str) -> List[str]:
+        """Parse [FILES: path1, path2, ...] from agent response."""
+        matches = FILE_EXTRACTION_PATTERN.findall(response)
+        files = []
+        for match in matches:
+            paths = [p.strip() for p in match.split(',')]
+            files.extend(paths)
+        return files
+
+    def _finalize_response(self, response: str):
+        """Complete the agent response and process extracted files."""
+        # Extract files from response
+        extracted_files = self._extract_files_from_response(response)
+
+        # Create and store message
+        agent_msg = ChatMessage(
+            role=MessageRole.ASSISTANT,
+            content=response,
+            extracted_files=extracted_files
+        )
+        self.chat_history.append(agent_msg)
+
+        # Finalize the streaming bubble
+        if self.current_streaming_bubble:
+            self._finalize_streaming_bubble(self.current_streaming_bubble)
+        self.current_streaming_bubble = None
+
+        # Auto-add extracted files to selection
+        if extracted_files:
+            self._auto_select_extracted_files(extracted_files)
+
+    def _finalize_stopped_response(self, response: str):
+        """Finalize a response that was stopped by the user."""
+        # Still extract any files that were mentioned before stopping
+        extracted_files = self._extract_files_from_response(response)
+
+        # Create and store message (partial response)
+        agent_msg = ChatMessage(
+            role=MessageRole.ASSISTANT,
+            content=response,
+            extracted_files=extracted_files
+        )
+        self.chat_history.append(agent_msg)
+
+        # Update and finalize the streaming bubble
+        if self.current_streaming_bubble:
+            self._update_streaming_bubble(self.current_streaming_bubble, response)
+            self._finalize_streaming_bubble(self.current_streaming_bubble)
+        self.current_streaming_bubble = None
+
+        self._log_message("Generation stopped.", "info")
+
+        # Still auto-add any extracted files
+        if extracted_files:
+            self._auto_select_extracted_files(extracted_files)
+
+    def _auto_select_extracted_files(self, file_paths: List[str]):
+        """Add extracted files to the file selection panel."""
+        added_count = 0
+        for rel_path in file_paths:
+            # Normalize path
+            rel_path = rel_path.strip().replace('\\', '/')
+            abs_path = os.path.join(self.directory, os.path.normpath(rel_path))
+            if os.path.exists(abs_path):
+                if self._add_file_to_selection(rel_path):
+                    added_count += 1
+
+        if added_count > 0:
+            self._update_ui_state()
+            self._log_message(f"Agent suggested {added_count} file(s) - added to selection", "success")
+        elif file_paths:
+            self._log_message(f"Agent suggested {len(file_paths)} file(s) but none were found", "warning")
+
+    # === WebSocket Message Injection ===
+
+    def _inject_external_query(self, query: str):
+        """Inject a query from external WebSocket client into the chat."""
+        if not query.strip():
+            return
+
+        # Don't inject if already generating
+        if self._generation_in_progress:
+            self._log_message("Cannot inject query while generation in progress", "warning")
+            return
+
+        # Add as user message
+        user_msg = ChatMessage(role=MessageRole.USER, content=query)
+        self.chat_history.append(user_msg)
+        self._add_chat_bubble(user_msg)
+
+        # Switch to Stop button and get response
+        self._set_generation_state(True)
+        threading.Thread(target=self._get_agent_response, daemon=True).start()
+
+        self._log_message(f"Received external query via WebSocket", "info")
+
+    def _inject_external_response(self, response: str):
+        """Inject a response from external WebSocket client into the chat."""
+        if not response.strip():
+            return
+
+        # Extract files and create message
+        extracted_files = self._extract_files_from_response(response)
+        agent_msg = ChatMessage(
+            role=MessageRole.ASSISTANT,
+            content=response,
+            extracted_files=extracted_files
+        )
+        self.chat_history.append(agent_msg)
+        self._add_chat_bubble(agent_msg)
+
+        # Auto-select extracted files
+        if extracted_files:
+            self._auto_select_extracted_files(extracted_files)
+
+        self._log_message(f"Received external response via WebSocket", "info")
+
+    def _create_preview_widgets(self):
+        preview_header_frame = ttk.Frame(self.preview_frame)
+        preview_header_frame.pack(fill=tk.X, pady=(5, 0))
+        ttk.Label(preview_header_frame, text="Preview", font=("Segoe UI", 10, "bold")).pack(side=tk.LEFT)
+        self.preview_stats_var = tk.StringVar()
+        ttk.Label(preview_header_frame, textvariable=self.preview_stats_var, foreground="#aaaaaa").pack(side=tk.RIGHT)
+        self.preview_text = scrolledtext.ScrolledText(self.preview_frame, height=10, wrap=tk.WORD, bg=DARK_ENTRY_BG, fg=DARK_FG, font=("Consolas", 10), borderwidth=0, highlightthickness=1)
+        self.preview_text.pack(fill=tk.BOTH, expand=True, pady=(5, 0))
+
+        # Enable Ctrl+A to select all
+        def select_all_preview(event):
+            self.preview_text.tag_add(tk.SEL, "1.0", tk.END)
+            self.preview_text.mark_set(tk.INSERT, "1.0")
+            self.preview_text.see(tk.INSERT)
+            return "break"
+        self.preview_text.bind("<Control-a>", select_all_preview)
+
+    def _bind_events(self):
+        self.tree.bind("<Double-1>", self.on_tree_double_click)
+        self.tree.bind('<<TreeviewOpen>>', self.on_tree_expand)
+        self.selected_files_tree.bind("<Double-1>", lambda e: self.remove_selected())
+        self.selected_files_tree.bind("<Button-1>", self.on_drag_start)
+        self.selected_files_tree.bind("<B1-Motion>", self.on_drag_motion)
+        self.selected_files_tree.bind("<<TreeviewSelect>>", lambda e: self.update_preview())
+        self.selected_files_tree.bind("<Delete>", lambda e: self.remove_selected())
+        self.selected_files_tree.bind("<Key-Delete>", lambda e: self.remove_selected())
+        self.selected_files_tree.bind("<Control-a>", self.select_all_files)
+        self.selected_files_tree.bind("<Command-a>", self.select_all_files)
+        # Bind column header clicks for sorting
+        for col in ["filepath", "filetype", "filesize", "char_count", "changed"]:
+            self.selected_files_tree.heading(col, command=lambda c=col: self._on_column_click(c))
+        self.preset_combobox.bind("<<ComboboxSelected>>", self.on_preset_selected)
+        self.search_var.trace_add("write", self._debounce_search)
+        self.exclude_dirs_var.trace_add("write", self._debounce_search)
+        self.exclude_patterns_var.trace_add("write", self._debounce_search)
+        self.exclusion_var.trace_add("write", self._debounce_search)
+        self.use_gitignore_var.trace_add("write", self._debounce_search)
+        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+        for widget in [self.search_entry, self.exclusion_entry, self.exclude_dirs_entry, self.exclude_patterns_entry, self.preview_text, self.apply_changes_text]:
+            self._bind_select_all(widget)
+            
+    def _log_message(self, message: str, level: str = 'info'):
+        def update_log():
+            if self.root.winfo_exists():
+                self.log_text.config(state=tk.NORMAL)
+                timestamp = datetime.now().strftime('%H:%M:%S')
+                self.log_text.insert(tk.END, f"[{timestamp}] {message}\n", (level,))
+                self.log_text.see(tk.END)
+                self.log_text.config(state=tk.DISABLED)
+        if hasattr(self, 'root') and self.root:
+            self.root.after(0, update_log)
+    
+    def _initiate_apply_changes(self):
+        content = self.apply_changes_text.get("1.0", tk.END).strip()
+        if not content:
+            self._log_message("Apply Changes: Textbox is empty.", 'warning')
+            return
+        self._log_message("Apply Changes: Starting file writing operation...")
+        threading.Thread(target=self._apply_changes_worker, args=(content,), daemon=True).start()
+
+    def _apply_changes_worker(self, content: str):
+        results, operation = apply_changes_with_history(content, self.directory)
+
+        # Add to history if operation was created
+        if operation:
+            self.apply_history.add_operation(operation)
+            self.root.after(0, self._update_history_buttons)
+
+        for file_path in results["success"]:
+            self._log_message(f"  ✓ Applied changes to {file_path}", 'success')
+        for error_msg in results["errors"]:
+            self._log_message(f"  ✗ {error_msg}", 'error')
+        summary = f"Apply Changes: Finished. {len(results['success'])} success, {len(results['errors'])} errors."
+        self._log_message(summary, 'error' if results['errors'] else 'success')
+        if results['success']:
+            # Show success status in the label
+            status_text = f"Applied! Written: {len(results['success'])} files | {results.get('total_chars', 0)} chars"
+            self.root.after(0, lambda: self.apply_status_label.config(text=status_text))
+            # Hide the label after 5 seconds
+            self.root.after(5000, lambda: self.apply_status_label.config(text=""))
+            self.root.after(0, self._perform_filter)
+
+    def _initiate_preview_changes(self):
+        """Show the preview changes dialog."""
+        content = self.apply_changes_text.get("1.0", tk.END).strip()
+        if not content:
+            self._log_message("Preview Changes: Textbox is empty.", 'warning')
+            return
+        
+        self._log_message("Preview Changes: Parsing file changes...")
+        try:
+            changes = preview_changes_to_files(content, self.directory)
+            if not changes:
+                self._log_message("Preview Changes: No valid file blocks found.", 'warning')
+                return
+            
+            self._log_message(f"Preview Changes: Found {len(changes)} file changes.")
+            
+            # Show the preview dialog
+            dialog = PreviewChangesDialog(self.root, changes, self.directory)
+            
+            if dialog.result == 'apply_selected':
+                # Apply the selected changes
+                selected_changes = [c for c in changes if c.selected]
+                if selected_changes:
+                    self._log_message(f"Applying {len(selected_changes)} selected changes...")
+                    threading.Thread(target=self._apply_selected_changes_worker, args=(selected_changes,), daemon=True).start()
+                else:
+                    self._log_message("No changes selected for application.", 'warning')
+            
+        except Exception as e:
+            self._log_message(f"Preview Changes Error: {e}", 'error')
+
+    def _apply_selected_changes_worker(self, changes: List[FileChange]):
+        """Apply the selected changes in a worker thread."""
+        results, operation = apply_selected_with_history(changes)
+
+        # Add to history if operation was created
+        if operation:
+            self.apply_history.add_operation(operation)
+            self.root.after(0, self._update_history_buttons)
+
+        for file_path in results["success"]:
+            self._log_message(f"  ✓ Applied changes to {file_path}", 'success')
+        for error_msg in results["errors"]:
+            self._log_message(f"  ✗ {error_msg}", 'error')
+        summary = f"Apply Selected Changes: Finished. {len(results['success'])} success, {len(results['errors'])} errors."
+        self._log_message(summary, 'error' if results['errors'] else 'success')
+        if results['success']:
+            self.root.after(0, self._perform_filter)
+
+    def _update_history_buttons(self):
+        """Update the enabled/disabled state of undo/redo buttons."""
+        can_undo = self.apply_history.can_undo(self.directory)
+        can_redo = self.apply_history.can_redo(self.directory)
+
+        if can_undo:
+            self.btn_undo.state(['!disabled'])
+        else:
+            self.btn_undo.state(['disabled'])
+
+        if can_redo:
+            self.btn_redo.state(['!disabled'])
+        else:
+            self.btn_redo.state(['disabled'])
+
+        # Update history label
+        history = self.apply_history.get_history(self.directory)
+        pos = self.apply_history.get_position(self.directory)
+        if history:
+            self.history_label.config(text=f"History: {pos + 1}/{len(history)}")
+        else:
+            self.history_label.config(text="")
+
+    def _initiate_undo(self):
+        """Start the undo operation."""
+        operation = self.apply_history.get_undo_operation(self.directory)
+        if not operation:
+            return
+
+        # Validate current state matches what we expect (after_snapshots)
+        validation = validate_file_state(operation.after_snapshots)
+
+        if not validation.is_valid:
+            # Show warning dialog
+            msg = "Files have been modified since the last apply:\n\n"
+            msg += "\n".join(f"  - {m}" for m in validation.mismatches[:5])
+            if len(validation.mismatches) > 5:
+                msg += f"\n  ... and {len(validation.mismatches) - 5} more"
+            msg += "\n\nUndo anyway? This will overwrite current changes."
+
+            if not messagebox.askyesno("State Mismatch Warning", msg, icon='warning'):
+                return
+
+        self._log_message(f"Undo: Reverting {len(operation.before_snapshots)} file(s)...")
+        threading.Thread(
+            target=self._undo_worker,
+            args=(operation,),
+            daemon=True
+        ).start()
+
+    def _undo_worker(self, operation: ApplyOperation):
+        """Worker thread for undo operation."""
+        results = apply_snapshots(operation.before_snapshots)
+
+        # Move history position backward
+        self.apply_history.move_backward(self.directory)
+
+        for file_path in results["success"]:
+            self._log_message(f"  ↩ Restored {file_path}", 'success')
+        for error_msg in results["errors"]:
+            self._log_message(f"  ✗ {error_msg}", 'error')
+
+        summary = f"Undo: Finished. {len(results['success'])} restored, {len(results['errors'])} errors."
+        self._log_message(summary, 'error' if results['errors'] else 'success')
+
+        self.root.after(0, self._update_history_buttons)
+        self.root.after(0, self._perform_filter)
+
+    def _initiate_redo(self):
+        """Start the redo operation."""
+        operation = self.apply_history.get_redo_operation(self.directory)
+        if not operation:
+            return
+
+        # Validate current state matches what we expect (before_snapshots)
+        validation = validate_file_state(operation.before_snapshots)
+
+        if not validation.is_valid:
+            msg = "Files have been modified since the undo:\n\n"
+            msg += "\n".join(f"  - {m}" for m in validation.mismatches[:5])
+            if len(validation.mismatches) > 5:
+                msg += f"\n  ... and {len(validation.mismatches) - 5} more"
+            msg += "\n\nRedo anyway? This will overwrite current changes."
+
+            if not messagebox.askyesno("State Mismatch Warning", msg, icon='warning'):
+                return
+
+        self._log_message(f"Redo: Re-applying {len(operation.after_snapshots)} file(s)...")
+        threading.Thread(
+            target=self._redo_worker,
+            args=(operation,),
+            daemon=True
+        ).start()
+
+    def _redo_worker(self, operation: ApplyOperation):
+        """Worker thread for redo operation."""
+        results = apply_snapshots(operation.after_snapshots)
+
+        # Move history position forward
+        self.apply_history.move_forward(self.directory)
+
+        for file_path in results["success"]:
+            self._log_message(f"  ↪ Re-applied {file_path}", 'success')
+        for error_msg in results["errors"]:
+            self._log_message(f"  ✗ {error_msg}", 'error')
+
+        summary = f"Redo: Finished. {len(results['success'])} re-applied, {len(results['errors'])} errors."
+        self._log_message(summary, 'error' if results['errors'] else 'success')
+
+        self.root.after(0, self._update_history_buttons)
+        self.root.after(0, self._perform_filter)
+
+    def _set_smart_paste_status(self, text: str, color: str = DARK_FG):
+        self.smart_paste_status.config(text=text, foreground=color)
+
+    def _initiate_smart_paste(self):
+        # Guard against stale disabled state from a previous run
+        self.smart_paste_text.config(state=tk.NORMAL)
+        content = self.smart_paste_text.get("1.0", tk.END).strip()
+        if not content:
+            self._set_smart_paste_status("Textbox is empty.", "#FFA726")
+            self._log_message("Smart Paster: Textbox is empty.", 'warning')
+            return
+        self._set_smart_paste_status("Searching...", "#64B5F6")
+        self._log_message("Smart Paster: Starting file discovery...")
+        self.smart_paste_text.config(state=tk.DISABLED)
+        threading.Thread(target=self._smart_paste_worker, args=(content,), daemon=True).start()
+
+    def _smart_paste_worker(self, content: str):
+        try:
+            found_rel_paths = process_smart_request(
+                content, self.directory,
+                cached_file_list=self.all_text_files,
+            )
+            self.root.after(0, self._update_ui_with_smart_results, found_rel_paths)
+        except Exception as e:
+            self._log_message(f"Smart Paster Error: {e}", "error")
+            self.root.after(0, self._set_smart_paste_status, f"Error: {e}", "#F44336")
+        finally:
+            self.root.after(0, lambda: self.smart_paste_text.config(state=tk.NORMAL))
+
+    def _update_ui_with_smart_results(self, rel_paths: List[str]):
+        if not rel_paths:
+            self._set_smart_paste_status("No files found.", "#FFA726")
+            self._log_message("Smart Paster: No files found.", "warning")
+            return
+
+        added_count = 0
+        for rel_path in rel_paths:
+            abs_path = os.path.join(self.directory, os.path.normpath(rel_path))
+            if os.path.exists(abs_path):
+                if self._add_file_to_selection(rel_path):
+                    added_count += 1
+
+        if added_count > 0:
+            self._update_ui_state()
+            self._set_smart_paste_status(f"Added {added_count} file(s).", "#4CAF50")
+            self._log_message(f"Smart Paster: Added {added_count} new file(s) to selection.", "success")
+        else:
+            self._set_smart_paste_status("Files already selected.", "#64B5F6")
+            self._log_message("Smart Paster: All found files were already selected.", "info")
+
+    def start_async_project_load(self):
+        self._log_message("Scanning project files...")
+        threading.Thread(target=self._project_load_worker, daemon=True).start()
+
+    def _project_load_worker(self):
+        self._scan_and_cache_all_files()
+        self.root.after(0, self.finish_project_load)
+
+    def finish_project_load(self):
+        self.load_preset_into_ui()
+
+    def _is_file_content_supported(self, filepath: str) -> bool:
+        ext = os.path.splitext(filepath)[1].lower()
+        if ext in self.supported_binary_ext:
+            return True
+        return is_text_file(os.path.join(self.directory, filepath))
+
+    def on_tree_double_click(self, event: tk.Event):
+        item_id = self.tree.identify_row(event.y)
+        if item_id:
+            item = self.tree.item(item_id)
+            if 'file' in item.get('tags', []) and item['values']:
+                fp = item['values'][0]
+                if self._add_file_to_selection(fp):
+                    self._update_ui_state()
+            elif 'folder' in item.get('tags', []):
+                self.tree.selection_set(item_id)
+                self.add_selected_folder()
+
+    def repopulate_tree(self, files_to_display: Optional[List[str]] = None):
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        if files_to_display is None:
+            self.tree.bind('<<TreeviewOpen>>', self.on_tree_expand)
+            self.process_directory("", self.directory)
+            return
+        self.tree.unbind('<<TreeviewOpen>>')
+        if not files_to_display:
+            self.tree.insert("", "end", text="No matching files found.", tags=('info',))
+            return
+        nodes: Dict[str, str] = {"": ""}
+        for file_path in sorted(files_to_display):
+            parent_path = ""
+            path_parts = file_path.split('/')
+            for i, part in enumerate(path_parts[:-1]):
+                current_path = os.path.join(parent_path, part)
+                if current_path not in nodes:
+                    nodes[current_path] = self.tree.insert(nodes.get(parent_path, ""), 'end', text=f"📁 {part}", values=[current_path.replace(os.path.sep, '/')], tags=('folder',), open=True)
+                parent_path = current_path
+            self.tree.insert(nodes.get(parent_path, ""), 'end', text=f"📄 {path_parts[-1]}", values=[file_path], tags=('file',))
+        self.tree.tag_configure('file', foreground='#87CEEB')
+        self.tree.tag_configure('folder', foreground='#DDA0DD')
+
+    def add_all_visible_files(self):
+        visible_files, added_count = [], 0
+        def _collect_files(parent_id):
+            for child_id in self.tree.get_children(parent_id):
+                item = self.tree.item(child_id)
+                if 'file' in item.get('tags', []) and item['values']:
+                    visible_files.append(item['values'][0])
+                elif 'folder' in item.get('tags', []):
+                    _collect_files(child_id)
+        _collect_files("")
+        for fp in visible_files:
+            if self._add_file_to_selection(fp):
+                added_count += 1
+        if added_count > 0:
+            self._update_ui_state()
+        self._log_message(f"Added {added_count} visible file(s).")
+
+    def collapse_all_tree_items(self):
+        for item in self.tree.get_children():
+            self.tree.item(item, open=False)
+
+    def load_preset_into_ui(self):
+        name = self.preset_var.get()
+        if not name or name not in self.presets:
+            return
+        self._log_message(f"Loading preset '{name}'...")
+        data = self.presets[name]
+        self.search_var.set(data.get("filter_text", ""))
+        self.advanced_exclude_var.set(data.get("advanced_exclude_mode", False))
+        self.exclude_dirs_var.set(data.get("exclude_dirs", get_default_exclude_dirs()))
+        self.exclude_patterns_var.set(data.get("exclude_patterns", "*.log *.json *.csv *.env .DS_Store .gitignore"))
+        self.exclusion_var.set(data.get("exclusion_regex", get_default_advanced_exclusion_regex()))
+        self.use_gitignore_var.set(data.get("use_gitignore", False))
+        
+        saved_websocket_state = data.get("websocket_enabled", True)
+        if saved_websocket_state != self.websocket_enabled:
+            self.websocket_enabled = saved_websocket_state
+            self.btn_toggle_server.config(text="Disable Server" if self.websocket_enabled else "Enable Server")
+        self._toggle_exclude_mode()
+        self._perform_filter(from_preset_load=True)
+        self.clear_all(auto_save=False)
+        added = 0
+        for fp in data.get("selected_files", []):
+            if os.path.exists(os.path.join(self.directory, os.path.normpath(fp))):
+                if self._add_file_to_selection(fp):
+                    added += 1
+        self._update_ui_state(auto_save=False)
+        self._log_message(f"Loaded preset '{name}'. ({added}/{len(data.get('selected_files', []))} files).")
+
+    def auto_save_current_preset(self):
+        name = self.preset_var.get()
+        if not name:
+            return
+        data = {"selected_files": self._get_selected_files_ordered(), "filter_text": self.search_var.get(), "advanced_exclude_mode": self.advanced_exclude_var.get(), "exclude_dirs": self.exclude_dirs_var.get(), "exclude_patterns": self.exclude_patterns_var.get(), "exclusion_regex": self.exclusion_var.get(), "use_gitignore": self.use_gitignore_var.get(), "websocket_enabled": self.websocket_enabled}
+        if self.presets.get(name) != data:
+            self.presets[name] = data
+            self.save_config()
+
+    def _toggle_exclude_mode(self):
+        if self.advanced_exclude_var.get():
+            self.simple_exclude_frame.pack_forget()
+            self.advanced_exclude_frame.pack(fill=tk.X, expand=True)
+        else:
+            self.advanced_exclude_frame.pack_forget()
+            self.simple_exclude_frame.pack(fill=tk.X, expand=True)
+        self._debounce_search()
+
+    def _get_exclusion_regex(self) -> Optional[re.Pattern]:
+        try:
+            parts = []
+
+            if self.advanced_exclude_var.get():
+                if exclusion_str := self.exclusion_var.get():
+                    parts.append(exclusion_str)
+            else:
+                dirs = [d for d in self.exclude_dirs_var.get().split() if d]
+                files = [p for p in self.exclude_patterns_var.get().split() if p]
+                if dirs:
+                    sep = re.escape(os.path.sep)
+                    dir_alternations = "|".join(re.escape(d) for d in dirs)
+                    dir_pattern = f"(^|{sep})({dir_alternations})({sep}|$)"
+                    parts.append(dir_pattern)
+                if files:
+                    file_patterns = [fnmatch.translate(p) for p in files]
+                    parts.extend(file_patterns)
+
+            # Add .gitignore patterns if enabled
+            if self.use_gitignore_var.get():
+                gitignore_path = os.path.join(self.directory, '.gitignore')
+                gitignore_patterns = parse_gitignore(gitignore_path, self.directory)
+                if gitignore_patterns:
+                    parts.extend(gitignore_patterns)
+
+            if not parts:
+                return None
+
+            final_regex_str = "|".join(f"({p})" for p in parts)
+            return re.compile(final_regex_str, re.IGNORECASE)
+        except re.error as e:
+            self._log_message(f"Regex Error: {e}", 'error')
+            return None
+
+    def _scan_and_cache_all_files(self):
+        all_files_list, regex = [], self._get_exclusion_regex()
+        for root, dirs, files in os.walk(self.directory, topdown=True):
+            rel_root = os.path.relpath(root, self.directory).replace(os.path.sep, '/')
+            dirs[:] = [d for d in dirs if not (regex and regex.search(f"{rel_root}/{d}/".replace('./', '')))]
+            for filename in files:
+                rel_path = os.path.relpath(os.path.join(root, filename), self.directory).replace(os.path.sep, '/')
+                if not (regex and regex.search(rel_path)) and is_includable_file(os.path.join(root, filename)):
+                    all_files_list.append(rel_path)
+        self.all_text_files = sorted(all_files_list, key=str.lower)
+
+    def _perform_filter(self, from_preset_load: bool = False):
+        search_term = self.search_var.get().lower()
+        current_exclusion_state = (self.advanced_exclude_var.get(), self.exclude_dirs_var.get(), self.exclude_patterns_var.get(), self.exclusion_var.get())
+        if not hasattr(self, '_last_exclusion_state') or self._last_exclusion_state != current_exclusion_state:
+            self._last_exclusion_state = current_exclusion_state
+            threading.Thread(target=self._scan_and_repopulate, args=(search_term, from_preset_load), daemon=True).start()
+        else:
+            files_to_display = [f for f in self.all_text_files if search_term in os.path.basename(f).lower()] if search_term else None
+            self.repopulate_tree(files_to_display)
+            if not from_preset_load:
+                self._debounce_auto_save()
+
+    def _scan_and_repopulate(self, search_term: str, from_preset_load: bool):
+        self._scan_and_cache_all_files()
+        def callback():
+            files_to_display = [f for f in self.all_text_files if search_term in os.path.basename(f).lower()] if search_term else None
+            self.repopulate_tree(files_to_display)
+            if not from_preset_load:
+                self._debounce_auto_save()
+        self.root.after(0, callback)
+
+    def _debounce_search(self, *args):
+        if self._search_job:
+            self.root.after_cancel(self._search_job)
+        self._search_job = self.root.after(300, self._perform_filter)
+
+    def load_project_config(self):
+        try:
+            if os.path.exists(self.config_file_path):
+                with open(self.config_file_path, 'r', encoding='utf-8') as f:
+                    self.full_config = json.load(f)
+        except (json.JSONDecodeError, IOError):
+            self.full_config = {}
+        if self.directory not in self.full_config:
+            self.full_config[self.directory] = {"presets": {DEFAULT_PRESET_NAME: {}}, "last_active_preset": DEFAULT_PRESET_NAME}
+        self.project_data = self.full_config[self.directory]
+        self.presets = self.project_data.get('presets', {})
+        if DEFAULT_PRESET_NAME not in self.presets:
+            self.presets[DEFAULT_PRESET_NAME] = {}
+        self.update_preset_combobox()
+        self.preset_var.set(self.project_data.get("last_active_preset", DEFAULT_PRESET_NAME))
+
+    def save_config(self, quiet: bool = True):
+        self.project_data['last_active_preset'] = self.preset_var.get()
+        self.project_data['presets'] = self.presets
+        self.full_config[self.directory] = self.project_data
+        try:
+            with open(self.config_file_path, 'w', encoding='utf-8') as f:
+                json.dump(self.full_config, f, indent=4)
+            if not quiet:
+                self._log_message(f"Preset '{self.preset_var.get()}' saved.", 'success')
+        except IOError as e:
+            messagebox.showerror("Config Error", f"Could not save config: {e}")
+
+    def _debounce_auto_save(self, *args):
+        if self._auto_save_job:
+            self.root.after_cancel(self._auto_save_job)
+        self._auto_save_job = self.root.after(1500, self.auto_save_current_preset)
+
+    def update_preset_combobox(self):
+        self.preset_combobox['values'] = [DEFAULT_PRESET_NAME] + sorted([p for p in self.presets.keys() if p != DEFAULT_PRESET_NAME], key=str.lower)
+
+    def save_current_as_preset(self):
+        name = simpledialog.askstring("Save New Preset", "Enter a name:", parent=self.root)
+        if not (name and name.strip()):
+            return
+        name = name.strip()
+        if name in self.presets and not messagebox.askyesno("Confirm Overwrite", f"Preset '{name}' exists. Overwrite?", parent=self.root):
+            return
+        self.auto_save_current_preset()
+        current_name = self.preset_var.get()
+        if current_name in self.presets:
+            self.presets[name] = self.presets[current_name]
+        self.update_preset_combobox()
+        self.preset_var.set(name)
+        self.save_config(quiet=False)
+
+    def on_preset_selected(self, event=None):
+        self.load_preset_into_ui()
+        self._debounce_auto_save()
+
+    def remove_selected_preset(self):
+        name = self.preset_var.get()
+        if name == DEFAULT_PRESET_NAME:
+            messagebox.showerror("Action Denied", "Default preset cannot be removed.")
+            return
+        if messagebox.askyesno("Confirm Deletion", f"Delete preset '{name}'?", parent=self.root):
+            if name in self.presets:
+                del self.presets[name]
+                self.update_preset_combobox()
+                self.preset_var.set(DEFAULT_PRESET_NAME)
+                self.load_preset_into_ui()
+                self.save_config()
+                self._log_message(f"Preset '{name}' removed.", 'info')
+
+    def _bind_select_all(self, w: tk.Widget):
+        def sa(e=None):
+            if isinstance(w, (ttk.Entry, tk.Entry)):
+                w.select_range(0, 'end')
+            elif isinstance(w, (scrolledtext.ScrolledText, tk.Text)):
+                w.tag_add('sel', '1.0', 'end')
+            return "break"
+        w.bind("<Control-a>", sa)
+        w.bind("<Command-a>", sa)
+
+    def _setup_interrupt_handler(self):
+        self.interrupted = False
+        try:
+            signal.signal(signal.SIGINT, lambda s, f: setattr(self, 'interrupted', True))
+        except (ValueError, TypeError):
+            pass
+        self.root.after(250, self._check_for_interrupt)
+
+    def _check_for_interrupt(self):
+        if self.interrupted:
+            self.on_closing()
+        else:
+            self.root.after(250, self._check_for_interrupt)
+
+    def process_directory(self, parent_id: str, path: str):
+        try:
+            items = sorted(os.listdir(path), key=str.lower)
+        except (OSError, PermissionError):
+            return
+        regex = self._get_exclusion_regex()
+        for cid in self.tree.get_children(parent_id):
+            if self.tree.item(cid, "values") == ("dummy",):
+                self.tree.delete(cid)
+        for name in items:
+            full_path = os.path.join(path, name)
+            rel_path = os.path.relpath(full_path, self.directory).replace(os.path.sep, '/')
+            is_dir = os.path.isdir(full_path)
+            check_path = rel_path + '/' if is_dir else rel_path
+            if regex and regex.search(check_path):
+                continue
+            if is_dir:
+                did = self.tree.insert(parent_id, 'end', text=f"📁 {name}", values=[rel_path], tags=('folder',))
+                self.tree.insert(did, 'end', text='...', values=['dummy'])
+            elif is_includable_file(full_path):
+                self.tree.insert(parent_id, 'end', text=f"📄 {name}", values=[rel_path], tags=('file',))
+        self.tree.tag_configure('file', foreground='#87CEEB')
+        self.tree.tag_configure('folder', foreground='#DDA0DD')
+
+    def on_tree_expand(self, event: Optional[tk.Event]):
+        item_id = self.tree.focus()
+        self._populate_tree_node(item_id)
+        
+    def _populate_tree_node(self, item_id: str):
+        if not item_id or not (children := self.tree.get_children(item_id)) or self.tree.item(children[0], "values") != ("dummy",):
+            return
+        if full_path_parts := self.tree.item(item_id, "values"):
+            self.process_directory(item_id, os.path.join(self.directory, full_path_parts[0].replace('/', os.path.sep)))
+            
+    def expand_all_tree_items(self):
+        for item in self.tree.get_children():
+            self._expand_tree_item_recursive(item)
+            
+    def _expand_tree_item_recursive(self, item_id: str):
+        self._populate_tree_node(item_id)
+        if self.tree.get_children(item_id):
+            self.tree.item(item_id, open=True)
+            for child in self.tree.get_children(item_id):
+                self._expand_tree_item_recursive(child)
+
+    def get_all_files_in_folder(self, path: str) -> List[str]:
+        return [f for f in self.all_text_files if f.replace(os.path.sep, '/').startswith(path.replace(os.path.sep, '/') + '/')]
+
+    def add_selected_folder(self):
+        if not self.tree.selection():
+            return
+        item = self.tree.item(self.tree.selection()[0])
+        if 'folder' not in item['tags']:
+            return
+        path, files, count = item['values'][0], self.get_all_files_in_folder(item['values'][0]), 0
+        for fp in files:
+            if self._add_file_to_selection(fp):
+                count += 1
+        if count > 0:
+            self._update_ui_state()
+        self._log_message(f"Added {count} file(s) from {os.path.basename(path)}.")
+
+    def select_all_files(self, event=None):
+        """Select all files in the selected files tree."""
+        all_items = self.selected_files_tree.get_children()
+        if all_items:
+            self.selected_files_tree.selection_set(all_items)
+        return "break"  # Prevent further event propagation
+
+    def _on_column_click(self, column: str):
+        """Handle column header click to sort files."""
+        # Toggle sort direction if same column, otherwise default to ascending
+        if self.sort_column == column:
+            self.sort_reverse = not self.sort_reverse
+        else:
+            self.sort_column = column
+            self.sort_reverse = False
+
+        # Disable drag and drop while sorted
+        self.drag_enabled = False
+
+        # Perform the sort
+        self._sort_selected_files()
+
+        # Update header text to show sort indicator
+        self._update_column_headers()
+
+    def _update_column_headers(self):
+        """Update column headers to show sort indicators."""
+        headers = {
+            "filepath": "File Path",
+            "filetype": "Type",
+            "filesize": "Size",
+            "char_count": "Characters",
+            "changed": "Modified"
+        }
+
+        for col, text in headers.items():
+            if col == self.sort_column:
+                indicator = " ▼" if self.sort_reverse else " ▲"
+                self.selected_files_tree.heading(col, text=text + indicator)
+            else:
+                self.selected_files_tree.heading(col, text=text)
+
+    def _sort_selected_files(self):
+        """Sort files in the tree by the current sort column."""
+        if not self.sort_column:
+            return
+
+        # Gather all items with their data
+        items = []
+        for item_id in self.selected_files_tree.get_children():
+            values = self.selected_files_tree.item(item_id, "values")
+            tags = self.selected_files_tree.item(item_id, "tags")
+            items.append((values, tags))
+
+        # Define sort key based on column
+        def get_sort_key(item):
+            values = item[0]
+            filepath = values[0]  # First column is always filepath
+
+            col_index = {
+                "filepath": 0,
+                "filetype": 1,
+                "filesize": 2,
+                "char_count": 3,
+                "changed": 4
+            }[self.sort_column]
+
+            value = values[col_index] if col_index < len(values) else ""
+
+            # Handle special cases for numeric columns using stored metadata
+            if self.sort_column == "filesize":
+                # Use raw bytes from metadata for proper sorting
+                metadata = self.file_metadata.get(filepath, {})
+                return metadata.get('filesize_bytes', 0)
+
+            elif self.sort_column == "char_count":
+                # Handle "N/A" and numeric values
+                try:
+                    return int(value.replace(",", "")) if value != "N/A" else -1
+                except (ValueError, AttributeError):
+                    return -1
+
+            elif self.sort_column == "changed":
+                # Use raw timestamp from metadata for proper sorting
+                metadata = self.file_metadata.get(filepath, {})
+                return metadata.get('timestamp', 0)
+
+            # For text columns, use natural string sorting
+            return str(value).lower()
+
+        # Sort items
+        items.sort(key=get_sort_key, reverse=self.sort_reverse)
+
+        # Clear tree and repopulate in sorted order
+        for item_id in self.selected_files_tree.get_children():
+            self.selected_files_tree.delete(item_id)
+
+        for values, tags in items:
+            self.selected_files_tree.insert("", tk.END, values=values, tags=tags)
+
+        self._update_ui_state()
+
+    def remove_selected(self):
+        selection = self.selected_files_tree.selection()
+        if selection:
+            # Remove all selected items
+            for selected_item in selection:
+                fp = self.selected_files_tree.item(selected_item, "values")[0]
+                self.selected_files_tree.delete(selected_item)
+                if fp in self.selected_files_map:
+                    del self.selected_files_map[fp]
+                if fp in self.file_metadata:
+                    del self.file_metadata[fp]
+            self._update_ui_state()
+
+    def clear_all(self, auto_save: bool = True):
+        for item in self.selected_files_tree.get_children():
+            self.selected_files_tree.delete(item)
+        self.selected_files_map.clear()
+        self.file_metadata.clear()
+        self._update_ui_state(auto_save=auto_save)
+
+    def update_selected_count(self):
+        c = len(self.selected_files_tree.get_children())
+        self.selected_count_var.set(f"{c} file{'s' if c != 1 else ''} selected")
+
+    def toggle_preview(self):
+        self.preview_visible = not self.preview_visible
+        if self.preview_visible:
+            self.preview_frame.pack(side=tk.BOTTOM, fill=tk.BOTH, expand=True, pady=(10, 0), in_=self.main_container, before=self.vertical_pane)
+            self.update_preview()
+        else:
+            self.preview_frame.pack_forget()
+        self.btn_toggle_preview.configure(text="Hide Preview" if self.preview_visible else "Show Preview")
+
+    def copy_to_clipboard(self):
+        if pyperclip is None:
+            messagebox.showerror("Error", "Install pyperclip: pip install pyperclip")
+            return
+        selected = self._get_selected_files_ordered()
+        if not selected and not self.append_filetree_var.get():
+            self._log_message("Copy: No files selected and Filetree disabled.", 'warning')
+            return
+        self._log_message("Copy: Processing content...")
+        self.root.update_idletasks()
+        out = build_clipboard_content([os.path.join(self.directory, f) for f in selected], self.directory, append_tree=self.append_filetree_var.get(), exclusion_regex=self._get_exclusion_regex())
+        pyperclip.copy(out)
+        
+        # Show temporary "Copied!" label
+        formatted_len = f"{len(out):,}".replace(",", ".")
+        self.copied_label.config(text=f"Copied! ({formatted_len} chars)")
+        if self._copy_timer:
+            self.root.after_cancel(self._copy_timer)
+        self._copy_timer = self.root.after(3000, lambda: self.copied_label.config(text=""))
+        
+        size_kb = len(out) / 1024
+        self._log_message(f"Copied {len(selected)} file(s) to clipboard! ({size_kb:.1f} KB)", 'success')
+
+    def on_drag_start(self, event: tk.Event):
+        if not self.drag_enabled:
+            return
+        self.drag_start_item = self.selected_files_tree.identify_row(event.y)
+
+    def on_drag_motion(self, event: tk.Event):
+        if not self.drag_enabled or not self.drag_start_item:
+            return
+
+        item_over = self.selected_files_tree.identify_row(event.y)
+        if item_over and item_over != self.drag_start_item:
+            # Check if drag_start_item still exists in the tree
+            if self.selected_files_tree.exists(self.drag_start_item):
+                self.selected_files_tree.move(self.drag_start_item, "", self.selected_files_tree.index(item_over))
+                self._update_ui_state()
+            else:
+                # Reset drag operation if item no longer exists
+                self.drag_start_item = None
+    
+    def _add_file_to_selection(self, filepath: str) -> bool:
+        if filepath in self.selected_files_map:
+            return False
+
+        self.selected_files_map[filepath] = True
+
+        # Gather file metadata
+        full_path = os.path.join(self.directory, filepath)
+
+        # Get file type (extension)
+        filetype = os.path.splitext(filepath)[1] or "N/A"
+
+        # Get file size and timestamp
+        try:
+            file_stat = os.stat(full_path)
+            filesize_bytes = file_stat.st_size
+            filesize_str = format_filesize(filesize_bytes)
+            timestamp = file_stat.st_mtime
+
+            # Get last modified time
+            changed_str = format_timestamp(timestamp)
+
+            # Store raw metadata for sorting
+            self.file_metadata[filepath] = {
+                'filesize_bytes': filesize_bytes,
+                'timestamp': timestamp
+            }
+        except (OSError, FileNotFoundError):
+            filesize_str = "N/A"
+            changed_str = "N/A"
+            self.file_metadata[filepath] = {
+                'filesize_bytes': 0,
+                'timestamp': 0
+            }
+
+        # Get character count (existing logic)
+        char_count_str = "N/A"
+        try:
+            if is_text_file(full_path):
+                with open(full_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    char_count_str = f"{len(f.read()):,}"
+        except Exception:
+            pass # Keep N/A
+
+        tags = () if self._is_file_content_supported(filepath) else ('unsupported',)
+        self.selected_files_tree.insert("", tk.END, values=(filepath, filetype, filesize_str, char_count_str, changed_str), tags=tags)
+        return True
+
+    # --- WebSocket Server Control Methods ---
+    def toggle_websocket_server(self):
+        if self.websocket_enabled:
+            self._stop_websocket_server()
+            self.websocket_enabled = False
+            self.btn_toggle_server.config(text="Enable Server")
+            self._log_message("WebSocket server disabled.", "info")
+        else:
+            self.websocket_enabled = True
+            self.btn_toggle_server.config(text="Disable Server")
+            threading.Thread(target=self._start_websocket_server, daemon=True).start()
+            self._log_message("WebSocket server enabled.", "info")
+    
+    def restart_websocket_server(self):
+        self._log_message("Restarting WebSocket server...", "info")
+        self._stop_websocket_server()
+        if self.websocket_enabled:
+            threading.Thread(target=self._start_websocket_server, daemon=True).start()
+    
+    def _stop_websocket_server(self):
+        try:
+            if self.websocket_server:
+                self.websocket_server.close()
+                if (self.websocket_loop and not self.websocket_loop.is_closed() and self.websocket_loop.is_running()):
+                    def close_server():
+                        try:
+                            if self.websocket_server:
+                                asyncio.create_task(self.websocket_server.wait_closed())
+                        except Exception:
+                            pass
+                    self.websocket_loop.call_soon_threadsafe(close_server)
+        except Exception:
+            pass
+        finally:
+            self._cleanup_websocket_state()
+    
+    def disconnect_all_clients(self):
+        if not self.connected_clients:
+            self._log_message("No clients to disconnect.", "info")
+            return
+        
+        client_count = len(self.connected_clients)
+        clients_to_close = list(self.connected_clients)
+        for client in clients_to_close:
+            if (self.websocket_loop and not self.websocket_loop.is_closed() and self.websocket_loop.is_running()):
+                try:
+                    asyncio.run_coroutine_threadsafe(client.close(), self.websocket_loop)
+                except Exception:
+                    pass
+        self._log_message(f"Disconnected {client_count} client(s).", "info")
+    
+    def _refresh_connections_display(self):
+        server_running = (self.websocket_server and self.websocket_loop and self.websocket_loop.is_running())
+        
+        if server_running:
+            self.server_status_var.set("Running")
+            self.status_label.config(foreground="#4CAF50")
+            if self.websocket_start_time:
+                uptime = datetime.now() - self.websocket_start_time
+                hours, remainder = divmod(int(uptime.total_seconds()), 3600)
+                minutes, seconds = divmod(remainder, 60)
+                self.server_uptime_var.set(f"Uptime: {hours:02d}:{minutes:02d}:{seconds:02d}")
+        elif not self.websocket_enabled:
+            self.server_status_var.set("Disabled")
+            self.status_label.config(foreground="#FFC107")
+            self.server_uptime_var.set("Uptime: --")
+        else:
+            self.server_status_var.set("Stopped")
+            self.status_label.config(foreground="#F44336")
+            self.server_uptime_var.set("Uptime: --")
+        
+        if self.actual_websocket_port:
+            port_text = f"Port: {self.actual_websocket_port}"
+            if self.actual_websocket_port != self.websocket_port:
+                port_text += f" (configured: {self.websocket_port})"
+            self.server_port_var.set(port_text)
+        else:
+            self.server_port_var.set(f"Port: {self.websocket_port} (configured)")
+        
+        self.client_count_var.set(f"Connected: {len(self.connected_clients)}")
+        
+        self.clients_listbox.delete(0, tk.END)
+        if self.client_info:
+            for websocket, info in self.client_info.items():
+                duration_str = f"{int((datetime.now() - info['connect_time']).total_seconds())}s"
+                self.clients_listbox.insert(tk.END, f"{info['address']} - Connected: {duration_str}")
+        
+        if self.connections_refresh_job:
+            self.root.after_cancel(self.connections_refresh_job)
+        self.connections_refresh_job = self.root.after(1000, self._refresh_connections_display)
+    
+    def _cleanup_websocket_state(self):
+        self.websocket_server = None
+        self.websocket_loop = None
+        self.websocket_start_time = None
+        self.actual_websocket_port = None
+        self.connected_clients.clear()
+        self.client_info.clear()
+    
+    def _save_websocket_config(self):
+        if not self.actual_websocket_port:
+            return
+        try:
+            websocket_config = {
+                'host': self.websocket_host,
+                'port': self.actual_websocket_port,
+                'start_time': self.websocket_start_time.isoformat() if self.websocket_start_time else None,
+                'uri': f"ws://{self.websocket_host}:{self.actual_websocket_port}"
+            }
+            if 'global' not in self.full_config:
+                self.full_config['global'] = {}
+            self.full_config['global']['websocket_server'] = websocket_config
+            self.save_config(quiet=True)
+            self._log_message("WebSocket server config updated", "info")
+        except Exception as e:
+            self._log_message(f"Failed to save WebSocket config: {e}", "warning")
+    
+    def _safe_broadcast_update(self):
+        if not self.websocket_server or not self.connected_clients or not self.websocket_loop:
+            return
+        try:
+            if not self.websocket_loop.is_closed() and self.websocket_loop.is_running():
+                asyncio.run_coroutine_threadsafe(self._broadcast_update(), self.websocket_loop)
+        except Exception:
+            pass
+    
+    def _delayed_websocket_start(self):
+        if self.websocket_enabled:
+            threading.Thread(target=self._start_websocket_server, daemon=True).start()
+            self.root.after(2000, self._safe_broadcast_update)
+
+    def _copy_usage_instruction(self):
+        # Generate project tree using user's exclusion settings
+        exclusion_regex = self._get_exclusion_regex()
+        project_tree = generate_visual_tree(self.directory, exclusion_regex)
+
+        instruction = f"""# Apply Changes - Usage
+
+## Surgical Patch (modify sections of existing files)
+```
+# PATCH path/to/file.ext
+```lang
+<<<< SEARCH
+[exact existing code]
+====
+[replacement code]
+>>>>
+```
+- SEARCH must match exactly (whitespace matters)
+- First occurrence only; file must exist
+- Can include multiple SEARCH/REPLACE blocks
+
+## Full Overwrite (replace entire file or create new)
+Format options (any work):
+- **File:** `path/to/file.ext` followed by code block
+- `# path/to/file.ext` + code block
+- Code block with `# path/to/file.ext` as first line
+
+Creates new files if path doesn't exist; overwrites if it does.
+
+## Rules
+- Relative paths only (no `..` or absolute)
+- File extension required
+
+## Project Structure:
+{project_tree}"""
+        if pyperclip:
+            pyperclip.copy(instruction)
+            self._log_message("Usage instructions copied to clipboard.", "success")
+        else:
+            self._log_message("Pyperclip not installed.", "error")
+
+
+class PreviewChangesDialog:
+    """Modal dialog for previewing file changes with GitHub-style diff display."""
+    
+    def __init__(self, parent: tk.Tk, changes: List[FileChange], directory: str):
+        self.parent = parent
+        self.changes = changes
+        self.directory = directory
+        self.result = None  # Will be set to 'apply', 'apply_selected', or None
+        
+        # Create modal window
+        self.dialog = tk.Toplevel(parent)
+        self.dialog.title("Preview File Changes")
+        self.dialog.geometry("1200x800")
+        self.dialog.configure(bg=DARK_BG)
+        self.dialog.transient(parent)
+        self.dialog.grab_set()
+        
+        # Center the dialog
+        self.dialog.update_idletasks()
+        x = (self.dialog.winfo_screenwidth() // 2) - (1200 // 2)
+        y = (self.dialog.winfo_screenheight() // 2) - (800 // 2)
+        self.dialog.geometry(f"1200x800+{x}+{y}")
+        
+        self._setup_styles()
+        self._create_widgets()
+        self._populate_data()
+        
+        # Handle window close
+        self.dialog.protocol("WM_DELETE_WINDOW", self._on_cancel)
+        
+        # Wait for dialog to close
+        self.dialog.wait_window()
+    
+    def _setup_styles(self):
+        """Apply dark theme styles to the dialog."""
+        style = ttk.Style()
+        
+        # Configure styles for the dialog
+        style.configure("Preview.TFrame", background=DARK_BG)
+        style.configure("Preview.TLabel", background=DARK_BG, foreground=DARK_FG)
+        style.configure("Preview.TButton", background=DARK_BUTTON_BG, foreground=DARK_FG)
+        style.configure("Preview.Treeview", background=DARK_TREE_BG, foreground=DARK_FG, fieldbackground=DARK_TREE_BG)
+        style.map("Preview.Treeview", background=[('selected', DARK_SELECT_BG)])
+        
+    def _create_widgets(self):
+        """Create and layout all dialog widgets."""
+        main_frame = ttk.Frame(self.dialog, style="Preview.TFrame", padding=10)
+        main_frame.pack(fill=tk.BOTH, expand=True)
+        
+        # Header with summary
+        header_frame = ttk.Frame(main_frame, style="Preview.TFrame")
+        header_frame.pack(fill=tk.X, pady=(0, 10))
+        
+        ttk.Label(header_frame, text="File Changes Preview", 
+                 font=("Segoe UI", 14, "bold"), style="Preview.TLabel").pack(side=tk.LEFT)
+        
+        self.summary_label = ttk.Label(header_frame, style="Preview.TLabel")
+        self.summary_label.pack(side=tk.RIGHT)
+        
+        # Create notebook for tabs
+        self.notebook = ttk.Notebook(main_frame)
+        self.notebook.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
+        
+        # Files overview tab
+        self._create_files_tab()
+        
+        # Individual file tabs
+        self._create_file_tabs()
+        
+        # Bottom buttons
+        buttons_frame = ttk.Frame(main_frame, style="Preview.TFrame")
+        buttons_frame.pack(fill=tk.X)
+        
+        ttk.Button(buttons_frame, text="Cancel", command=self._on_cancel,
+                  style="Preview.TButton").pack(side=tk.LEFT)
+        
+        ttk.Button(buttons_frame, text="Apply Selected", command=self._on_apply_selected,
+                  style="Preview.TButton").pack(side=tk.RIGHT, padx=(5, 0))
+        
+        ttk.Button(buttons_frame, text="Apply All", command=self._on_apply_all,
+                  style="Preview.TButton").pack(side=tk.RIGHT)
+    
+    def _create_files_tab(self):
+        """Create the files overview tab."""
+        files_frame = ttk.Frame(self.notebook, style="Preview.TFrame", padding=10)
+        self.notebook.add(files_frame, text="Files Overview")
+        
+        # Files tree
+        tree_frame = ttk.Frame(files_frame, style="Preview.TFrame")
+        tree_frame.pack(fill=tk.BOTH, expand=True)
+        
+        self.files_tree = ttk.Treeview(tree_frame, 
+                                      columns=("status", "type", "changes"), 
+                                      show="tree headings",
+                                      style="Preview.Treeview")
+        
+        self.files_tree.heading("#0", text="File Path", anchor='w')
+        self.files_tree.heading("status", text="Status", anchor='w')
+        self.files_tree.heading("type", text="Type", anchor='w')
+        self.files_tree.heading("changes", text="Changes", anchor='w')
+        
+        self.files_tree.column("#0", width=400, stretch=tk.YES)
+        self.files_tree.column("status", width=150, stretch=tk.NO)
+        self.files_tree.column("type", width=100, stretch=tk.NO)
+        self.files_tree.column("changes", width=150, stretch=tk.NO)
+        
+        # Add checkboxes functionality
+        self.files_tree.bind("<Button-1>", self._on_tree_click)
+        
+        # Scrollbar for tree
+        tree_scrollbar = ttk.Scrollbar(tree_frame, orient='vertical', command=self.files_tree.yview)
+        self.files_tree.configure(yscrollcommand=tree_scrollbar.set)
+        
+        self.files_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        tree_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        # Selection controls
+        controls_frame = ttk.Frame(files_frame, style="Preview.TFrame")
+        controls_frame.pack(fill=tk.X, pady=(10, 0))
+        
+        ttk.Button(controls_frame, text="Select All", command=self._select_all,
+                  style="Preview.TButton").pack(side=tk.LEFT)
+        ttk.Button(controls_frame, text="Select None", command=self._select_none,
+                  style="Preview.TButton").pack(side=tk.LEFT, padx=(5, 0))
+        
+    def _create_file_tabs(self):
+        """Create individual tabs for each file with diff view."""
+        for i, change in enumerate(self.changes):
+            if change.change_type == ChangeType.INVALID_PATH:
+                continue
+                
+            tab_frame = ttk.Frame(self.notebook, style="Preview.TFrame", padding=10)
+            tab_name = os.path.basename(change.file_path)
+            if len(tab_name) > 20:
+                tab_name = tab_name[:17] + "..."
+            self.notebook.add(tab_frame, text=tab_name)
+            
+            # File info header
+            info_frame = ttk.Frame(tab_frame, style="Preview.TFrame")
+            info_frame.pack(fill=tk.X, pady=(0, 10))
+            
+            ttk.Label(info_frame, text=f"File: {change.file_path}", 
+                     font=("Segoe UI", 11, "bold"), style="Preview.TLabel").pack(anchor='w')
+            ttk.Label(info_frame, text=change.status_summary, 
+                     style="Preview.TLabel").pack(anchor='w')
+            
+            # Diff content
+            diff_text = scrolledtext.ScrolledText(tab_frame, 
+                                                 wrap=tk.NONE, 
+                                                 bg=DARK_ENTRY_BG, 
+                                                 fg=DARK_FG, 
+                                                 font=("Consolas", 10),
+                                                 borderwidth=0, 
+                                                 highlightthickness=1)
+            diff_text.pack(fill=tk.BOTH, expand=True)
+            
+            # Configure diff highlighting
+            diff_text.tag_config("added", foreground="#22C55E", background="#0F2A1A")
+            diff_text.tag_config("removed", foreground="#F87171", background="#2A0F0F") 
+            diff_text.tag_config("context", foreground="#9CA3AF")
+            diff_text.tag_config("header", foreground="#60A5FA", font=("Consolas", 10, "bold"))
+            
+            # Enable Ctrl+A to select all
+            diff_text.bind("<Control-a>", lambda e, w=diff_text: (w.tag_add(tk.SEL, "1.0", tk.END), w.mark_set(tk.INSERT, "1.0"), w.see(tk.INSERT), "break")[-1])
+
+            self._populate_diff_content(diff_text, change)
+            diff_text.config(state=tk.DISABLED)
+    
+    def _populate_diff_content(self, text_widget: scrolledtext.ScrolledText, change: FileChange):
+        """Populate the diff content for a file change."""
+        if change.change_type == ChangeType.NEW_FILE:
+            text_widget.insert(tk.END, f"New file: {change.file_path}\n", "header")
+            text_widget.insert(tk.END, f"+++ {change.file_path}\n", "header")
+            for line_num, line in enumerate(change.content.splitlines(), 1):
+                text_widget.insert(tk.END, f"+{line_num:4d}: {line}\n", "added")
+        elif change.change_type == ChangeType.MODIFY_FILE and change.diff_lines:
+            for line in change.diff_lines:
+                if line.startswith('+++') or line.startswith('---') or line.startswith('@@'):
+                    text_widget.insert(tk.END, line + '\n', "header")
+                elif line.startswith('+'):
+                    text_widget.insert(tk.END, line + '\n', "added")
+                elif line.startswith('-'):
+                    text_widget.insert(tk.END, line + '\n', "removed")
+                else:
+                    text_widget.insert(tk.END, line + '\n', "context")
+    
+    def _populate_data(self):
+        """Populate the files tree with change data."""
+        total_files = len(self.changes)
+        new_files = sum(1 for c in self.changes if c.change_type == ChangeType.NEW_FILE)
+        modified_files = sum(1 for c in self.changes if c.change_type == ChangeType.MODIFY_FILE)
+        invalid_files = sum(1 for c in self.changes if c.change_type == ChangeType.INVALID_PATH)
+        
+        self.summary_label.config(text=f"{total_files} files ({new_files} new, {modified_files} modified, {invalid_files} invalid)")
+        
+        for i, change in enumerate(self.changes):
+            checkbox_text = "☑" if change.selected else "☐"
+            if change.change_type == ChangeType.INVALID_PATH:
+                status = "❌ Invalid"
+                type_text = "Error"
+                checkbox_text = "☐"  # Invalid files can't be selected
+            elif change.change_type == ChangeType.NEW_FILE:
+                status = "📄 New File"
+                type_text = "New"
+            else:
+                status = "📝 Modified"
+                type_text = "Modified"
+            
+            item_id = self.files_tree.insert("", tk.END, 
+                                           text=f"{checkbox_text} {change.file_path}",
+                                           values=(status, type_text, change.status_summary),
+                                           tags=(f"change_{i}",))
+    
+    def _on_tree_click(self, event):
+        """Handle clicking on tree items to toggle selection."""
+        item = self.files_tree.identify('item', event.x, event.y)
+        if item:
+            tags = self.files_tree.item(item, 'tags')
+            if tags:
+                change_idx = int(tags[0].split('_')[1])
+                change = self.changes[change_idx]
+                
+                if change.change_type != ChangeType.INVALID_PATH:
+                    change.selected = not change.selected
+                    checkbox_text = "☑" if change.selected else "☐"
+                    current_text = self.files_tree.item(item, 'text')
+                    new_text = f"{checkbox_text} {change.file_path}"
+                    self.files_tree.item(item, text=new_text)
+    
+    def _select_all(self):
+        """Select all valid changes."""
+        for i, change in enumerate(self.changes):
+            if change.change_type != ChangeType.INVALID_PATH:
+                change.selected = True
+        self._refresh_tree()
+    
+    def _select_none(self):
+        """Deselect all changes."""
+        for change in self.changes:
+            change.selected = False
+        self._refresh_tree()
+    
+    def _refresh_tree(self):
+        """Refresh the tree display."""
+        for item in self.files_tree.get_children():
+            self.files_tree.delete(item)
+        self._populate_data()
+    
+    def _on_apply_all(self):
+        """Apply all valid changes."""
+        for change in self.changes:
+            if change.change_type != ChangeType.INVALID_PATH:
+                change.selected = True
+        self.result = 'apply_selected'
+        self.dialog.destroy()
+    
+    def _on_apply_selected(self):
+        """Apply only selected changes."""
+        self.result = 'apply_selected'
+        self.dialog.destroy()
+    
+    def _on_cancel(self):
+        """Cancel the dialog."""
+        self.result = None
+        self.dialog.destroy()
