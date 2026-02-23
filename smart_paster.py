@@ -776,7 +776,6 @@ def build_clipboard_content(file_paths: List[str], root_directory: str, max_size
             final_output = tree_str
     return final_output
 
-
 def _get_language_hint(filename: str) -> str:
     """Get language hint for syntax highlighting (local fallback)."""
     if _USE_SHARED:
@@ -786,20 +785,23 @@ def _get_language_hint(filename: str) -> str:
 
 def apply_text_patch(original_text: str, patch_block: str) -> Tuple[str, bool, str]:
     """
-    Applies a SEARCH/REPLACE block to original text.
+    Applies an XML <search>/<replace> block to original text.
     Returns: (new_text, success, message)
     """
-    # Regex to extract SEARCH and REPLACE blocks
-    # content between <<<< SEARCH and ====
-    # content between ==== and >>>>
+    # Normalize newlines to prevent standard LLM hallucination errors
+    original_text = original_text.replace('\r\n', '\n')
+    patch_block = patch_block.replace('\r\n', '\n')
+
+    # Regex to extract <search> and <replace> blocks
+    # \n? accounts for the LLM placing an immediate newline after the tag
     pattern = re.compile(
-        r'<<<< SEARCH\n(.*?)\n====\n(.*?)\n>>>>',
-        re.DOTALL
+        r'<search>\n?(.*?)\n?</search>\s*<replace>\n?(.*?)\n?</replace>',
+        re.DOTALL | re.IGNORECASE
     )
 
     matches = list(pattern.finditer(patch_block))
     if not matches:
-        return original_text, False, "Invalid patch format: Missing markers (<<<< SEARCH / ==== / >>>>)"
+        return original_text, False, "Invalid patch format: Missing <search> or <replace> tags."
 
     new_text = original_text
 
@@ -807,15 +809,24 @@ def apply_text_patch(original_text: str, patch_block: str) -> Tuple[str, bool, s
         search_content = match.group(1)
         replace_content = match.group(2)
 
-        # exact match attempt
+        # 1st Attempt: Exact match
         if search_content in new_text:
             new_text = new_text.replace(search_content, replace_content, 1)
-        else:
-            # Fallback: Try stripping whitespace from search block lines for looser matching
-            # (LLMs sometimes mess up indentation in the search block)
-            return original_text, False, "Could not locate SEARCH block in original file."
+            continue
+            
+        # 2nd Attempt: Fallback ignoring leading/trailing blank lines
+        # (LLMs frequently add or forget a trailing blank line in the search block)
+        search_stripped = search_content.strip('\n')
+        if search_stripped and search_stripped in new_text:
+            replace_stripped = replace_content.strip('\n')
+            new_text = new_text.replace(search_stripped, replace_stripped, 1)
+            continue
 
-    return new_text, True, "Patch applied"
+        # If we reach here, the search block wasn't found
+        preview = search_content[:100] + "..." if len(search_content) > 100 else search_content
+        return original_text, False, f"Could not locate SEARCH block exactly in file. Attempted to find:\n{preview}"
+
+    return new_text, True, "Patch applied successfully."
 
 def preview_changes_to_files(content_to_apply: str, root_directory: str) -> List[FileChange]:
     """
@@ -843,62 +854,104 @@ def preview_changes_to_files(content_to_apply: str, root_directory: str) -> List
          "inline_path", 3),
     ]
 
-    # --- 2. NEW PATTERN (For Patching) ---
-    # Matches: # PATCH filename \n ```...```
+    # --- 2. NEW PATTERN (For XML Patching) ---
+    # Matches: <patch file="filename">...</patch>
     patch_pattern = re.compile(
-        r"^#+\s*PATCH\s+(?:`([^`]+\.[a-zA-Z0-9]+)`|([^\s`]+\.[a-zA-Z0-9]+)).*?\n```(?:[a-zA-Z0-9]*)?\n(.*?)\n```",
-        re.DOTALL | re.MULTILINE
+        r'<patch\s+file=["\']([^"\']+)["\']\s*>(.*?)</patch>',
+        re.DOTALL | re.IGNORECASE
     )
 
     matched_files = set()
 
     # --- PROCESS PATCHES FIRST ---
     for match in patch_pattern.finditer(content_to_apply):
-        groups = match.groups()
-        file_path = groups[0] or groups[1]
-        raw_patch_content = groups[2]
+        file_path = match.group(1).strip()
+        raw_patch_content = match.group(2)
 
         if not file_path: continue
         matched_files.add(file_path)  # Mark as processed so overwrite patterns don't grab it
 
         full_path = os.path.join(root_directory, file_path.replace('/', os.path.sep))
-
-        if not os.path.exists(full_path):
+        
+        # Security Check
+        if ".." in file_path or os.path.isabs(file_path):
             changes.append(FileChange(
                 file_path=file_path, content="", change_type=ChangeType.INVALID_PATH,
-                full_path=full_path, error_message="Cannot patch: File does not exist"
+                full_path="", error_message="Unsafe path"
             ))
             continue
 
-        try:
-            with open(full_path, 'r', encoding='utf-8') as f:
-                original_content = f.read()
+        # Check if it's a surgical patch (has <search>) or full overwrite
+        is_surgical = "<search>" in raw_patch_content.lower()
 
-            # Apply the patch logic
-            new_content, success, msg = apply_text_patch(original_content, raw_patch_content)
-
-            if success:
+        if is_surgical:
+            if not os.path.exists(full_path):
                 changes.append(FileChange(
-                    file_path=file_path,
-                    content=new_content,  # The GUI will compare this vs original_content
-                    change_type=ChangeType.MODIFY_FILE,
-                    full_path=full_path,
-                    original_content=original_content
+                    file_path=file_path, content="", change_type=ChangeType.INVALID_PATH,
+                    full_path=full_path, error_message="Cannot patch: File does not exist"
                 ))
+                continue
+
+            try:
+                with open(full_path, 'r', encoding='utf-8') as f:
+                    original_content = f.read()
+
+                # Apply the patch logic
+                new_content, success, msg = apply_text_patch(original_content, raw_patch_content)
+
+                if success:
+                    changes.append(FileChange(
+                        file_path=file_path,
+                        content=new_content,
+                        change_type=ChangeType.MODIFY_FILE,
+                        full_path=full_path,
+                        original_content=original_content
+                    ))
+                else:
+                    changes.append(FileChange(
+                        file_path=file_path,
+                        content=original_content,
+                        change_type=ChangeType.INVALID_PATH,
+                        full_path=full_path,
+                        error_message=f"Patch Failed: {msg}"
+                    ))
+            except Exception as e:
+                changes.append(FileChange(
+                    file_path=file_path, content="", change_type=ChangeType.INVALID_PATH,
+                    full_path=full_path, error_message=f"Error reading file: {e}"
+                ))
+        else:
+            # Full overwrite logic for <patch> block
+            # Extract content inside <replace> if it exists, otherwise use raw text
+            replace_match = re.search(r'<replace>\n?(.*?)\n?</replace>', raw_patch_content, re.DOTALL | re.IGNORECASE)
+            if replace_match:
+                new_content = replace_match.group(1)
+            else:
+                new_content = raw_patch_content.strip()
+
+            if os.path.exists(full_path):
+                try:
+                    with open(full_path, 'r', encoding='utf-8') as f:
+                        original_content = f.read()
+                    changes.append(FileChange(
+                        file_path=file_path,
+                        content=new_content + '\n',
+                        change_type=ChangeType.MODIFY_FILE,
+                        full_path=full_path,
+                        original_content=original_content
+                    ))
+                except Exception as e:
+                    changes.append(FileChange(
+                        file_path=file_path, content="", change_type=ChangeType.INVALID_PATH,
+                        full_path=full_path, error_message=str(e)
+                    ))
             else:
                 changes.append(FileChange(
                     file_path=file_path,
-                    content=original_content,  # No change
-                    change_type=ChangeType.INVALID_PATH,
-                    full_path=full_path,
-                    error_message=f"Patch Failed: {msg}"
+                    content=new_content + '\n',
+                    change_type=ChangeType.NEW_FILE,
+                    full_path=full_path
                 ))
-
-        except Exception as e:
-            changes.append(FileChange(
-                file_path=file_path, content="", change_type=ChangeType.INVALID_PATH,
-                full_path=full_path, error_message=f"Error reading file: {e}"
-            ))
 
     # --- PROCESS OVERWRITES (Existing Logic) ---
     for pattern_regex, _, content_group_idx in patterns:
@@ -983,83 +1036,27 @@ def apply_selected_changes(changes: List[FileChange]) -> Dict[str, List[str]]:
 
 def apply_changes_to_files(content_to_apply: str, root_directory: str) -> Dict[str, List[str]]:
     """
-    Apply changes to files using multi-pattern matching.
-
-    Supports multiple formats (tried in priority order):
-    1. **File:** annotation - e.g., "**File:** `path/to/file.ext`"
-    2. Heading immediately followed by code block - e.g., "# path/to/file.ext"
-    3. Code block with # path inside - e.g., "```\n# path/to/file.ext\n..."
+    Apply changes to files by first parsing them into FileChange objects,
+    then writing them. This ensures exact consistency between previewing and applying.
     """
-    results: Dict[str, List[str]] = {"success": [], "errors": []}
+    changes = preview_changes_to_files(content_to_apply, root_directory)
+    
+    # Select all valid changes for application
+    for change in changes:
+        if change.change_type != ChangeType.INVALID_PATH:
+            change.selected = True
+            
+    results = apply_selected_changes(changes)
+    
+    # Calculate total chars for backward compatibility with existing return dict
     total_chars = 0
-
-    # Define patterns in order of specificity (most specific first)
-    patterns = [
-        # Pattern 1: **File:** annotation (most explicit user intent)
-        (r'\*\*File:\*\*\s*`?([^\s`\n]+\.[a-zA-Z0-9]+)`?.*?\n```(?:[a-zA-Z0-9]*)?\n(.*?)\n```',
-         "file_annotation", 2),
-
-        # Pattern 2: Heading with file path (allows text before path like "Update file.py")
-        (r"^#+\s*(?:\d+\.\s*)?.*?(?:`([^`]+\.[a-zA-Z0-9]+)`|([^\s`]+\.[a-zA-Z0-9]+)).*?\n```(?:[a-zA-Z0-9]*)?\n(.*?)\n```",
-         "heading_format", 3),
-
-        # Pattern 3: Code block with # path inside (fallback)
-        (r"^```(?:[a-zA-Z0-9]*)?\n\s*#\s*(?:`([^`]+\.[a-zA-Z0-9]+)`|([^\s`]+\.[a-zA-Z0-9]+))\n(.*?)\n```",
-         "inline_path", 3),
-    ]
-
-    # Track which files and code blocks we've already applied to avoid duplicates
-    matched_files = set()
-    matched_code_blocks = set()
-
-    for pattern_regex, pattern_name, content_group_idx in patterns:
-        pattern = re.compile(pattern_regex, re.DOTALL | re.MULTILINE)
-
-        for match in pattern.finditer(content_to_apply):
-            # Extract file path from first non-None capture group (excluding content)
-            groups = match.groups()
-            file_path = None
-            for i in range(len(groups) - 1):  # All groups except the last (content)
-                if groups[i]:
-                    file_path = groups[i].strip()
-                    break
-
-            if not file_path:
-                continue
-
-            # Skip if we've already processed this file (prioritize earlier patterns)
-            if file_path in matched_files:
-                continue
-
-            content = groups[content_group_idx - 1]  # Get content group
-
-            # Create a signature to detect duplicate code blocks
-            code_block_signature = (content[:100] if len(content) > 100 else content, len(content))
-            if code_block_signature in matched_code_blocks:
-                continue
-
-            matched_files.add(file_path)
-            matched_code_blocks.add(code_block_signature)
-
-            # Validate path safety
-            if ".." in file_path or os.path.isabs(file_path):
-                results["errors"].append(f"Skipped unsafe path: {file_path}")
-                continue
-
-            full_path = os.path.join(root_directory, file_path.replace('/', os.path.sep))
-            try:
-                os.makedirs(os.path.dirname(full_path), exist_ok=True)
-                content_stripped = content.strip()
-                with open(full_path, 'w', encoding='utf-8') as f:
-                    f.write(content_stripped + '\n')
-                results["success"].append(file_path)
-                total_chars += len(content_stripped)
-            except Exception as e:
-                results["errors"].append(f"Failed to write {file_path}: {e}")
-
+    for change in changes:
+        if change.file_path in results.get("success", []):
+            total_chars += len(change.content)
+            
     if not results["success"] and not results["errors"]:
         results["errors"].append("No valid file blocks found to apply.")
-
+        
     results["total_chars"] = total_chars
     return results
 

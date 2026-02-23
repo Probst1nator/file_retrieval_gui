@@ -119,6 +119,7 @@ BUBBLE_AGENT_FG = "#ffffff"
 
 # File extraction pattern for agent responses
 FILE_EXTRACTION_PATTERN = re.compile(r'\[FILES?:\s*([^\]]+)\]', re.IGNORECASE)
+PATCH_FILE_PATTERN = re.compile(r'<patch\s+file=["\']([^"\']+)["\']\s*>', re.IGNORECASE)
 
 
 class MessageRole(Enum):
@@ -1251,35 +1252,83 @@ class FileCopierApp:
         self.current_streaming_bubble = None
 
     def _build_system_prompt(self, enabled_tools: List[str]) -> str:
-        """Build system prompt with file extraction instructions."""
+        """Build system prompt with file extraction and patch instructions."""
         tool_list = ", ".join(enabled_tools) if enabled_tools else "none"
 
-        return f"""You are an AI assistant helping users explore and navigate a codebase.
+        prompt = f"""You are an AI assistant helping users explore, navigate, and modify a codebase.
 
 AVAILABLE TOOLS: {tool_list}
 
+## Identifying Files
 IMPORTANT: When you identify files that are relevant to the user's query, you MUST include them in your response using this exact format:
-[FILES: path/to/file1.py, path/to/file2.js, path/to/file3.txt]
-
+[FILES: path/to/file1.py, path/to/file2.js]
 This format allows the GUI to automatically select these files for the user.
 
+## Modifying Files
+When you need to modify existing files or create new ones, you MUST use the following XML-based patch format. You can output multiple `<patch>` blocks in a single response.
+
+### Modifying Existing Files (Surgical Patch)
+Use the `<patch>` block with `<search>` and `<replace>` tags.
+- `<search>` MUST exactly match existing lines in the file (including indentation).
+- Provide enough surrounding context in `<search>` to uniquely identify the code.
+
+```xml
+<patch file="path/to/file.ext">
+<search>
+    def old_function():
+        # context line
+        pass
+</search>
+<replace>
+    def updated_function():
+        # context line
+        print("updated")
+</replace>
+</patch>
+```
+
+### Creating or Overwriting Files (Full Overwrite)
+To create a new file or completely overwrite an existing one, omit the `<search>` tag:
+
+```xml
+<patch file="path/to/new_file.ext">
+<replace>
+[entire file content here]
+</replace>
+</patch>
+```
+
 Guidelines:
-- Use relative paths from the project root
-- Separate multiple files with commas
-- Place the [FILES: ...] tag at the end of your response
-- Only include files that actually exist and are directly relevant
-- Be concise and helpful in your explanations
+- Relative paths only (no `..` or absolute)
+- File extension is required
+- Do not escape the XML tags; write them clearly in your response.
 
 Working directory: {self.directory}
 """
+        
+        # Only append the file tree if the checkbox is selected
+        if self.append_filetree_var.get():
+            exclusion_regex = self._get_exclusion_regex()
+            project_tree = generate_visual_tree(self.directory, exclusion_regex)
+            prompt += f"\nProject Structure:\n{project_tree}\n"
+
+        return prompt
 
     def _extract_files_from_response(self, response: str) -> List[str]:
-        """Parse [FILES: path1, path2, ...] from agent response."""
+        """Parse [FILES: path1, path2, ...] and <patch file="..."> from agent response."""
         matches = FILE_EXTRACTION_PATTERN.findall(response)
         files = []
         for match in matches:
             paths = [p.strip() for p in match.split(',')]
             files.extend(paths)
+            
+        # Also auto-select files targeted by <patch> blocks
+        patch_matches = PATCH_FILE_PATTERN.findall(response)
+        for path in patch_matches:
+            path = path.strip()
+            if path not in files:
+                files.append(path)
+                
         return files
 
     def _finalize_response(self, response: str):
@@ -1303,6 +1352,15 @@ Working directory: {self.directory}
         # Auto-add extracted files to selection
         if extracted_files:
             self._auto_select_extracted_files(extracted_files)
+
+        # Auto-populate Apply Changes tab if patches were generated
+        if "<patch " in response.lower() and "</patch>" in response.lower():
+            current_apply_text = self.apply_changes_text.get("1.0", tk.END).strip()
+            if current_apply_text:
+                self.apply_changes_text.insert(tk.END, "\n\n" + response)
+            else:
+                self.apply_changes_text.insert("1.0", response)
+            self._log_message("Detected <patch> blocks in response. Sent to Tools -> Apply Changes.", "success")
 
     def _finalize_stopped_response(self, response: str):
         """Finalize a response that was stopped by the user."""
@@ -1387,6 +1445,15 @@ Working directory: {self.directory}
         # Auto-select extracted files
         if extracted_files:
             self._auto_select_extracted_files(extracted_files)
+
+        # Auto-populate Apply Changes tab if patches were generated
+        if "<patch " in response.lower() and "</patch>" in response.lower():
+            current_apply_text = self.apply_changes_text.get("1.0", tk.END).strip()
+            if current_apply_text:
+                self.apply_changes_text.insert(tk.END, "\n\n" + response)
+            else:
+                self.apply_changes_text.insert("1.0", response)
+            self._log_message("Detected <patch> blocks via WebSocket. Sent to Tools -> Apply Changes.", "success")
 
         self._log_message(f"Received external response via WebSocket", "info")
 
@@ -2387,46 +2454,55 @@ Working directory: {self.directory}
             self.root.after(2000, self._safe_broadcast_update)
 
     def _copy_usage_instruction(self):
-        # Generate project tree using user's exclusion settings
-        exclusion_regex = self._get_exclusion_regex()
-        project_tree = generate_visual_tree(self.directory, exclusion_regex)
+        instruction = """Please use the following XML-based patch format to provide me your suggestions.
 
-        instruction = f"""# Apply Changes - Usage
+## Modifying Existing Files (Surgical Patch)
+Use the `<patch>` block with `<search>` and `<replace>` tags.
+- `<search>` MUST exactly match existing lines in the file (including indentation).
+- Provide enough surrounding context in `<search>` to uniquely identify the code.
 
-## Surgical Patch (modify sections of existing files)
+```xml
+<patch file="path/to/file.ext">
+<search>
+    def old_function():
+        # context line
+        pass
+</search>
+<replace>
+    def updated_function():
+        # context line
+        print("updated")
+</replace>
+</patch>
 ```
-# PATCH path/to/file.ext
-```lang
-<<<< SEARCH
-[exact existing code]
-====
-[replacement code]
->>>>
+
+## Creating or Overwriting Files (Full Overwrite)
+To create a new file or completely overwrite an existing one, omit the `<search>` tag:
+
+```xml
+<patch file="path/to/new_file.ext">
+<replace>
+[entire file content here]
+</replace>
+</patch>
 ```
-- SEARCH must match exactly (whitespace matters)
-- First occurrence only; file must exist
-- Can include multiple SEARCH/REPLACE blocks
-
-## Full Overwrite (replace entire file or create new)
-Format options (any work):
-- **File:** `path/to/file.ext` followed by code block
-- `# path/to/file.ext` + code block
-- Code block with `# path/to/file.ext` as first line
-
-Creates new files if path doesn't exist; overwrites if it does.
 
 ## Rules
 - Relative paths only (no `..` or absolute)
-- File extension required
+- File extension is required
+- Do not escape the XML tags; write them clearly in your response."""
 
-## Project Structure:
-{project_tree}"""
+        # Only append the file tree if the checkbox is selected
+        if self.append_filetree_var.get():
+            exclusion_regex = self._get_exclusion_regex()
+            project_tree = generate_visual_tree(self.directory, exclusion_regex)
+            instruction += f"\n\n## Project Structure:\n{project_tree}"
+
         if pyperclip:
             pyperclip.copy(instruction)
             self._log_message("Usage instructions copied to clipboard.", "success")
         else:
             self._log_message("Pyperclip not installed.", "error")
-
 
 class PreviewChangesDialog:
     """Modal dialog for previewing file changes with GitHub-style diff display."""
