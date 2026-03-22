@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# DEPRECATED: This module is no longer used by the GUI.
+# Tool discovery and agentic loop are now handled by explorer_agent.py
+# using _shared/agent infrastructure. Kept for reference.
 """
 A Read-only directory parser with codebase and document exploration capabilities.
 Optimized for efficient information retrieval, code analysis, and dependency mapping.

@@ -1,4 +1,7 @@
 # ollama_client.py
+# DEPRECATED: This module is no longer used by the GUI.
+# LLM access is now handled via _shared/agent/llm_router.py (LLMRouter)
+# through explorer_agent.py. Kept for reference.
 """
 Ollama REST API client for the Agentic Search feature.
 Uses urllib.request (standard library) to avoid new dependencies.

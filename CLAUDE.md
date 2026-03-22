@@ -13,6 +13,9 @@ python main.py [directory]
 
 # Run CLI mode (reads from clipboard, processes files, copies result to clipboard)
 python main.py -m [directory]
+
+# Launch GUI with an agentic search query (opens Agentic Search tab, auto-submits)
+python main.py [directory] -a "find all files that handle authentication"
 ```
 
 ## Architecture
@@ -21,7 +24,7 @@ This is a Tkinter-based GUI application for file management with WebSocket integ
 
 ### Core Components
 
-- **main.py** - Entry point, handles CLI args and launches either GUI or CLI mode
+- **main.py** - Entry point, handles CLI args (`-m` CLI mode, `-a QUERY` agentic query mode) and launches either GUI or CLI mode
 - **gui.py** - Main `FileCopierApp` class with the Tkinter interface, WebSocket server, and all UI logic
 - **smart_paster.py** - File discovery, path resolution, clipboard content building, and file change preview/apply logic
 
@@ -41,17 +44,19 @@ External tool that connects to the GUI's WebSocket server to retrieve current fi
 
 ### Agentic Search Tab
 
-Chat interface with Ollama integration for AI-assisted file discovery:
-- **ollama_client.py** - HTTP client for Ollama REST API (list models, streaming chat)
-- **ChatMessage** dataclass - Stores chat history with role, content, timestamp, extracted files
-- **Tool checkboxes** - Auto-detected from `agent/main.py:INTERRUPTING_TAGS`, dynamically enable/disable
-- **File extraction** - Parses `[FILES: path1, path2]` from agent responses, auto-adds to selection
+Chat interface with agentic capabilities for codebase exploration:
+- **explorer_agent.py** - `ExplorerAgentLoop` orchestrates `AgenticLoop`, `ToolDiscovery`, and `LLMRouter`. Changes cwd to project dir during queries so tools resolve relative paths correctly. Truncates LLM output after first XML tool call to prevent hallucination cascades from weaker models. System prompt passed via `system=` kwarg (not as a message) to avoid being silently dropped by Gemini's message converter.
+- **LLMRouter** (`_shared/agent/llm_router.py`) - Multi-provider LLM routing with fallback chaining (Gemini -> Ollama -> Anthropic -> llama.cpp). Model selected from `.env` config.
+- **ToolCap filtering** - Auto-discovers XML-based tools from `_shared/agent_tools/` and `agent_tools/` filtered by `ToolCap` enum capabilities (allows `READ` + `SANDBOXED` only, blocking `WRITE`/`EXECUTE`/`NETWORK`). Common tools: `grep`, `filesystem`, `readfile`, `file_search`.
+- **AgentsNotebookTool** - Persistent scratchpad (`~/.cache/file_retrieval_gui/agents_notebook.txt`) that agents use to save file paths during exploration. Displayed in the UI Notebook Panel.
+- **File extraction** - Parses `[FILES: path1, path2]` from final agent responses to auto-select files.
+- **Context logging** - Each session writes a JSONL log to `~/.cache/file_retrieval_gui/agent_logs/session_YYYYMMDD_HHMMSS.jsonl`. Events: `query_start` (system prompt, tools), `llm_response` (model, full text), `tool_result` (tool name, output preview), `query_complete` (full message context). "Copy agent log" button in the header copies the current session log to clipboard.
 
 **WebSocket Message Protocol** for external integration:
 ```json
 {"type": "agentic_search_query", "query": "find all API endpoints"}
 {"type": "agentic_search_response", "response": "Found these files... [FILES: api.py]"}
-{"type": "get_status"}  // Returns ollama status, model, enabled tools
+{"type": "get_status"}  // Returns connection status, model, enabled tools
 ```
 
 ## File Formats

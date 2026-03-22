@@ -129,6 +129,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="GUI/CLI to select and copy file contents.")
     parser.add_argument("directory", nargs="?", default=".", help="The directory to scan (default: current directory).")
     parser.add_argument("-m", "--message", action="store_true", help="Enable Smart Paster CLI mode. Reads from clipboard.")
+    parser.add_argument("-a", "--agent-query", type=str, default=None, metavar="QUERY",
+                        help="Launch GUI on Agentic Search tab and run QUERY immediately.")
     parser.add_argument("--install", action="store_true", help="Install desktop shortcut.")
     parser.add_argument("--remove", action="store_true", help="Remove desktop shortcut.")
     args = parser.parse_args()
@@ -181,7 +183,10 @@ def main() -> None:
             sys.exit(1)
     else:
         root = tk.Tk()
-        FileCopierApp(root, args.directory)
+        app = FileCopierApp(root, args.directory)
+        if args.agent_query:
+            # Schedule the query after GUI is fully initialized
+            root.after(1000, lambda: app.submit_agent_query(args.agent_query))
         root.mainloop()
 
 

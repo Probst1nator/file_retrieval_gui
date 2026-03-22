@@ -4,7 +4,7 @@ import sys
 import json
 import tkinter as tk
 from tkinter import ttk, messagebox, scrolledtext, simpledialog
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional
 from dataclasses import dataclass, field
 from enum import Enum
 import threading
@@ -47,7 +47,7 @@ from smart_paster import (
     generate_visual_tree
 )
 from exclusion_patterns import DEFAULT_EXCLUSION_PATTERNS, parse_pattern_string, parse_gitignore
-from ollama_client import OllamaClient, OllamaConfig
+# ollama_client no longer used directly — LLMRouter handles Ollama via _shared/agent
 
 # Load environment variables after imports
 load_dotenv()
@@ -214,7 +214,6 @@ class FileCopierApp:
     def _initialize_agentic_search_state(self):
         """Initialize state for the Agentic Search tab."""
         self.chat_history: List[ChatMessage] = []
-        self.ollama_client: Optional[OllamaClient] = None
         self.ollama_model_var: Optional[tk.StringVar] = None
         self.ollama_status_var: Optional[tk.StringVar] = None
         self.tool_vars: Dict[str, tk.BooleanVar] = {}
@@ -222,25 +221,10 @@ class FileCopierApp:
         self.chat_inner_frame: Optional[ttk.Frame] = None
         self.chat_canvas: Optional[tk.Canvas] = None
         self.agentic_search_enabled: bool = True
-        self._agent_tools: Set[str] = set()
         self._waiting_animation_job: Optional[str] = None
         self._waiting_animation_state: int = 0
         self._generation_in_progress: bool = False
         self._stop_generation: bool = False
-        self._load_agent_tools()
-
-    def _load_agent_tools(self):
-        """Load available tools from agent module."""
-        try:
-            # Try to import agent tools dynamically
-            agent_path = os.path.join(os.path.dirname(__file__), 'agent')
-            if agent_path not in sys.path:
-                sys.path.insert(0, agent_path)
-            from agent.main import INTERRUPTING_TAGS
-            self._agent_tools = set(INTERRUPTING_TAGS)
-        except ImportError:
-            # Fallback to default tools if agent module not available
-            self._agent_tools = {'readfile', 'grepsearch', 'filesystem', 'fileinfo', 'textprocess'}
 
     def _initialize_websocket_state(self):
         self.websocket_server = None  # type: ignore
@@ -371,7 +355,7 @@ class FileCopierApp:
                 # Return current status
                 status = {
                     "type": "status_response",
-                    "ollama_connected": self.ollama_client.is_available() if self.ollama_client else False,
+                    "llm_available": hasattr(self, "explorer_agent"),
                     "model": self.ollama_model_var.get() if self.ollama_model_var else None,
                     "chat_history_length": len(self.chat_history),
                     "enabled_tools": [t for t, var in self.tool_vars.items() if var.get()]
@@ -655,20 +639,20 @@ class FileCopierApp:
         self.top_pane.add(selection_frame, weight=3)
 
     def _create_bottom_notebook(self, parent):
-        notebook = ttk.Notebook(parent)
-        notebook.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
-        tools_tab = ttk.Frame(notebook, padding=5)
-        notebook.add(tools_tab, text="Tools")
+        self.bottom_notebook = ttk.Notebook(parent)
+        self.bottom_notebook.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
+        tools_tab = ttk.Frame(self.bottom_notebook, padding=5)
+        self.bottom_notebook.add(tools_tab, text="Tools")
         self._create_tools_pane(tools_tab)
-        log_tab = ttk.Frame(notebook, padding=5)
-        notebook.add(log_tab, text="Log")
+        log_tab = ttk.Frame(self.bottom_notebook, padding=5)
+        self.bottom_notebook.add(log_tab, text="Log")
         self._create_log_pane(log_tab)
-        connections_tab = ttk.Frame(notebook, padding=5)
-        notebook.add(connections_tab, text="Connections")
+        connections_tab = ttk.Frame(self.bottom_notebook, padding=5)
+        self.bottom_notebook.add(connections_tab, text="Connections")
         self._create_connections_pane(connections_tab)
-        agentic_search_tab = ttk.Frame(notebook, padding=5)
-        notebook.add(agentic_search_tab, text="Agentic Search")
-        self._create_agentic_search_pane(agentic_search_tab)
+        self.agentic_search_tab = ttk.Frame(self.bottom_notebook, padding=5)
+        self.bottom_notebook.add(self.agentic_search_tab, text="Agentic Search")
+        self._create_agentic_search_pane(self.agentic_search_tab)
 
     def _create_tools_pane(self, parent):
         tools_container = ttk.Frame(parent)
@@ -831,9 +815,18 @@ class FileCopierApp:
         # === INPUT AREA ===
         self._create_chat_input(main_container)
 
-        # Initialize Ollama client and refresh models
-        self.ollama_client = OllamaClient()
+        # === NOTEBOOK PANEL ===
+        self._create_notebook_panel(main_container)
+
+        # Initialize ExplorerAgentLoop
+        from explorer_agent import ExplorerAgentLoop
+        self.explorer_agent = ExplorerAgentLoop(
+            project_dir=self.directory,
+            on_tool_result=self._on_tool_result,
+            on_notebook_change=self._refresh_notebook
+        )
         self.root.after(500, self._refresh_ollama_models)
+        self._populate_tool_checkboxes()
 
     def _create_agentic_header(self, parent):
         """Create header with model selector and tool checkboxes."""
@@ -861,13 +854,16 @@ class FileCopierApp:
         self.tool_checkboxes_frame = ttk.Frame(header_frame)
         self.tool_checkboxes_frame.pack(side=tk.LEFT, padx=5)
 
-        # Populate tool checkboxes
-        self._populate_tool_checkboxes()
+        # Tool checkboxes populated later by _create_agentic_search_pane
+        # after explorer_agent is initialized
 
-        # Ollama status indicator
+        # Status indicator (right side)
         self.ollama_status_var = tk.StringVar(value="Checking...")
         self.ollama_status_label = ttk.Label(header_frame, textvariable=self.ollama_status_var, foreground="#FFC107")
         self.ollama_status_label.pack(side=tk.RIGHT)
+
+        # Copy agent log button (left of status)
+        ttk.Button(header_frame, text="Copy agent log", command=self._copy_agent_log).pack(side=tk.RIGHT, padx=(0, 5))
 
     def _populate_tool_checkboxes(self):
         """Populate checkboxes for available agent tools."""
@@ -875,10 +871,11 @@ class FileCopierApp:
             widget.destroy()
 
         self.tool_vars.clear()
-        for tool in sorted(self._agent_tools):
-            var = tk.BooleanVar(value=True)  # All enabled by default
-            self.tool_vars[tool] = var
-            cb = ttk.Checkbutton(self.tool_checkboxes_frame, text=tool, variable=var)
+        for tool in sorted(self.explorer_agent.tools, key=lambda t: t.name):
+            tool_name = tool.name
+            var = tk.BooleanVar(value=True) # All enabled by default
+            self.tool_vars[tool_name] = var
+            cb = ttk.Checkbutton(self.tool_checkboxes_frame, text=tool_name, variable=var)
             cb.pack(side=tk.LEFT, padx=2)
 
     def _create_chat_display(self, parent):
@@ -910,6 +907,25 @@ class FileCopierApp:
         self.chat_canvas.bind("<MouseWheel>", self._on_chat_mousewheel)
         self.chat_canvas.bind("<Button-4>", self._on_chat_mousewheel)
         self.chat_canvas.bind("<Button-5>", self._on_chat_mousewheel)
+
+    def _make_text_selectable_readonly(self, text_widget: tk.Text):
+        """Make a Text widget read-only while allowing text selection and copying.
+
+        Unlike state=DISABLED, this approach lets users click, drag-select,
+        and Ctrl+C/Ctrl+A to copy text from chat bubbles.
+        """
+        def _on_key(event):
+            # Allow copy (Ctrl+C), select all (Ctrl+A)
+            if event.state & 0x4 and event.keysym.lower() in ('c', 'a'):
+                return None
+            return "break"
+        text_widget.bind("<Key>", _on_key)
+        # Block right-click paste, drag-and-drop insertion, etc.
+        text_widget.bind("<<Paste>>", lambda e: "break")
+        text_widget.bind("<<Cut>>", lambda e: "break")
+        # Forward mousewheel to parent chat canvas
+        for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            text_widget.bind(seq, self._on_chat_mousewheel)
 
     def _on_chat_frame_configure(self, event):
         """Update scroll region when inner frame changes size."""
@@ -1028,17 +1044,14 @@ class FileCopierApp:
         )
         msg_text.insert("1.0", message.content)
 
-        # Auto-adjust height based on content
+        # Auto-adjust height based on content (no cap — bubbles expand fully)
         line_count = int(msg_text.index('end-1c').split('.')[0])
-        msg_text.config(height=min(max(line_count, 1), 20))
+        msg_text.config(height=max(line_count, 1))
 
         if not is_streaming:
-            msg_text.config(state=tk.DISABLED)
+            self._make_text_selectable_readonly(msg_text)
 
         msg_text.pack()
-
-        # Enable Ctrl+A to select all
-        msg_text.bind("<Control-a>", lambda e, w=msg_text: (w.tag_add(tk.SEL, "1.0", tk.END), w.mark_set(tk.INSERT, "1.0"), w.see(tk.INSERT), "break")[-1])
 
         # Scroll to bottom
         self.chat_canvas.update_idletasks()
@@ -1048,21 +1061,140 @@ class FileCopierApp:
 
     def _update_streaming_bubble(self, text_widget: tk.Text, content: str):
         """Update a streaming bubble with new content."""
-        text_widget.config(state=tk.NORMAL)
         text_widget.delete("1.0", tk.END)
         text_widget.insert("1.0", content)
 
-        # Auto-adjust height
+        # Auto-adjust height (no cap — bubbles expand fully)
         line_count = int(text_widget.index('end-1c').split('.')[0])
-        text_widget.config(height=min(max(line_count, 1), 20))
+        text_widget.config(height=max(line_count, 1))
 
         # Scroll to bottom
         self.chat_canvas.update_idletasks()
         self.chat_canvas.yview_moveto(1.0)
 
     def _finalize_streaming_bubble(self, text_widget: tk.Text):
-        """Finalize a streaming bubble (make it read-only)."""
-        text_widget.config(state=tk.DISABLED)
+        """Finalize a streaming bubble (make it read-only but selectable)."""
+        self._make_text_selectable_readonly(text_widget)
+
+
+    def _create_notebook_panel(self, parent):
+        """Create notebook panel."""
+        self.notebook_frame = ttk.LabelFrame(parent, text="Notebook (Agent Scratchpad)")
+        self.notebook_frame.pack(fill=tk.X, padx=5, pady=(0, 5))
+        
+        self.notebook_tree = ttk.Treeview(self.notebook_frame, show="tree", height=3)
+        self.notebook_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        # bind double click
+        self.notebook_tree.bind("<Double-1>", self._notebook_remove_entry)
+        
+        btn_frame = ttk.Frame(self.notebook_frame)
+        btn_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=5)
+        
+        ttk.Button(btn_frame, text="Add to Selection", command=self._notebook_add_to_selection).pack(side=tk.TOP, pady=2)
+        ttk.Button(btn_frame, text="Copy All", command=self._notebook_copy_all).pack(side=tk.TOP, pady=2)
+        ttk.Button(btn_frame, text="Clear", command=self._notebook_clear).pack(side=tk.TOP, pady=2)
+
+    def _refresh_notebook(self):
+        """Refresh the notebook treeview from file."""
+        for item in self.notebook_tree.get_children():
+            self.notebook_tree.delete(item)
+        if hasattr(self, "explorer_agent") and self.explorer_agent.notebook_tool:
+            entries = self.explorer_agent.notebook_tool.get_entries()
+            for e in entries:
+                self.notebook_tree.insert("", "end", text=e, values=(e,))
+
+    def _notebook_add_to_selection(self):
+        """Add notebook entries to selected files."""
+        if not hasattr(self, "explorer_agent") or not self.explorer_agent.notebook_tool:
+            return
+        entries = self.explorer_agent.notebook_tool.get_entries()
+        if entries:
+            self._auto_select_extracted_files(entries)
+            self._log_message(f"Added {len(entries)} items from notebook to selection.", "info")
+
+    def _notebook_copy_all(self):
+        """Copy all notebook entries to clipboard."""
+        if not hasattr(self, "explorer_agent") or not self.explorer_agent.notebook_tool:
+            return
+        entries = self.explorer_agent.notebook_tool.get_entries()
+        if entries:
+            try:
+                import pyperclip
+                pyperclip.copy("\n".join(entries))
+                self.copied_label.config(text="Copied!")
+                self.root.after(2000, lambda: self.copied_label.config(text=""))
+            except Exception as e:
+                self._log_message(f"Copy failed: {e}", "error")
+
+    def _notebook_clear(self):
+        """Clear notebook logic."""
+        if hasattr(self, "explorer_agent") and self.explorer_agent.notebook_tool:
+            self.explorer_agent.notebook_tool._write_entries([])
+            self._refresh_notebook()
+
+    def _notebook_remove_entry(self, event):
+        """Remove a single entry from notebook via double click."""
+        selection = self.notebook_tree.selection()
+        if selection and hasattr(self, "explorer_agent") and self.explorer_agent.notebook_tool:
+            item = selection[0]
+            entry_text = self.notebook_tree.item(item, "text")
+            entries = self.explorer_agent.notebook_tool.get_entries()
+            if entry_text in entries:
+                entries.remove(entry_text)
+                self.explorer_agent.notebook_tool._write_entries(entries)
+                self._refresh_notebook()
+
+    def _on_tool_result(self, tool_name: str, message: str):
+        self.root.after(0, lambda: self._show_tool_status(f"[{tool_name}: {message}]"))
+
+    def _show_tool_status(self, text: str):
+        """Show small inline tool status in chat (selectable text)."""
+        if not self.chat_inner_frame:
+            return
+        msg_frame = ttk.Frame(self.chat_inner_frame)
+        msg_frame.pack(fill=tk.X, pady=2, padx=20)
+
+        # Use a Text widget instead of Label so the user can select/copy
+        line_count = text.count('\n') + 1
+        tool_text = tk.Text(
+            msg_frame,
+            wrap=tk.WORD,
+            height=line_count,
+            bg=DARK_BG,
+            fg="#888888",
+            font=("Segoe UI", 9, "italic"),
+            borderwidth=0,
+            highlightthickness=0,
+            relief=tk.FLAT,
+            cursor="arrow"
+        )
+        tool_text.insert("1.0", text)
+        self._make_text_selectable_readonly(tool_text)
+        tool_text.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        self.root.update_idletasks()
+        self.chat_canvas.yview_moveto(1.0)
+
+    def _copy_agent_log(self):
+        """Copy the current session's agent log to clipboard."""
+        if not hasattr(self, "explorer_agent") or not hasattr(self.explorer_agent, "log_file"):
+            self._log_message("No agent log available.", "warning")
+            return
+        log_path = self.explorer_agent.log_file
+        if not log_path.exists():
+            self._log_message("Agent log file not found.", "warning")
+            return
+        try:
+            content = log_path.read_text(encoding="utf-8")
+            if pyperclip:
+                pyperclip.copy(content)
+                self._log_message(f"Agent log copied to clipboard ({len(content)} bytes).", "success")
+            else:
+                self.root.clipboard_clear()
+                self.root.clipboard_append(content)
+                self._log_message(f"Agent log copied to clipboard ({len(content)} bytes).", "success")
+        except Exception as e:
+            self._log_message(f"Failed to copy agent log: {e}", "error")
 
     def _clear_chat(self):
         """Clear all chat messages."""
@@ -1076,17 +1208,12 @@ class FileCopierApp:
     # === Ollama Integration Methods ===
 
     def _refresh_ollama_models(self):
-        """Fetch available models from Ollama API."""
-        def worker():
-            try:
-                if self.ollama_client:
-                    models = self.ollama_client.list_models()
-                    self.root.after(0, lambda: self._update_model_list(models))
-            except Exception as e:
-                self.root.after(0, lambda: self._set_ollama_status("Offline", "#F44336"))
-                self._log_message(f"Ollama connection error: {e}", "error")
-
-        threading.Thread(target=worker, daemon=True).start()
+        """Load available models."""
+        models = [f"{m.provider.value}:{m.model_name}" for m in getattr(self.explorer_agent.router, "models", [])]
+        if not models:
+            models = ["gemini:gemini-2.5-pro", "gemini:gemini-2.0-flash", "ollama:llama3"]
+        self._update_model_list(models)
+        self._set_ollama_status("Ready", "#4CAF50")
 
     def _update_model_list(self, models: List[str]):
         """Update model dropdown with available models."""
@@ -1148,51 +1275,48 @@ class FileCopierApp:
         threading.Thread(target=self._get_agent_response, daemon=True).start()
 
     def _get_agent_response(self):
-        """Worker thread for getting streaming response from Ollama."""
-        model = self.ollama_model_var.get() if self.ollama_model_var else None
-        if not model:
-            self.root.after(0, lambda: self._log_message("No model selected", "error"))
+        """Worker thread for getting response via ExplorerAgentLoop."""
+        enabled_tools = [t for t, var in self.tool_vars.items() if var.get()]
+        
+        if not enabled_tools:
+            self.root.after(0, lambda: self._log_message("No tools selected", "warning"))
+        
+        # We need the user query from the last message in chat_history
+        if not self.chat_history or self.chat_history[-1].role != MessageRole.USER:
             self.root.after(0, lambda: self._set_generation_state(False))
             return
-
-        # Build messages for API
-        messages = [msg.to_dict() for msg in self.chat_history]
-
-        # Add system prompt with enabled tools
-        enabled_tools = [t for t, var in self.tool_vars.items() if var.get()]
-        system_prompt = self._build_system_prompt(enabled_tools)
-        messages.insert(0, {"role": "system", "content": system_prompt})
-
+            
+        user_query = self.chat_history[-1].content
+        
         try:
             # Create placeholder bubble for streaming
             placeholder_msg = ChatMessage(role=MessageRole.ASSISTANT, content="...")
             self.root.after(0, lambda: self._create_streaming_bubble(placeholder_msg))
-
-            # Small delay to ensure bubble is created
-            import time
-            time.sleep(0.1)
-
-            # Stream response
-            full_response = ""
-            stopped = False
-            for chunk in self.ollama_client.chat_stream(model, messages):
-                # Check for stop request
+            
+            # Start generation logic
+            def callback(chunk: str):
                 if self._stop_generation:
-                    stopped = True
-                    full_response += "\n\n[Generation stopped by user]"
-                    break
-                full_response += chunk
-                # Update UI progressively
-                self.root.after(0, lambda r=full_response: self._update_current_streaming(r))
-
-            # Finalize response
-            if stopped:
+                    return
+                # For sync stream, replace the whole bubble if it's the full text
+                # We'll just update the bubble
+                self.root.after(0, lambda r=chunk: self._update_current_streaming(r))
+                
+            res = self.explorer_agent.run_query(
+                query=user_query,
+                active_tool_names=enabled_tools,
+                max_iterations=10,
+                print_callback=callback
+            )
+            
+            full_response = res["response"]
+            if self._stop_generation:
+                full_response += "\\n\\n[Generation stopped by user]"
                 self.root.after(0, lambda r=full_response: self._finalize_stopped_response(r))
             else:
                 self.root.after(0, lambda: self._finalize_response(full_response))
-
+                
         except Exception as e:
-            self.root.after(0, lambda: self._log_message(f"Ollama error: {e}", "error"))
+            self.root.after(0, lambda: self._log_message(f"Agent error: {e}", "error"))
             self.root.after(0, lambda: self._handle_streaming_error(str(e)))
         finally:
             self.root.after(0, lambda: self._set_generation_state(False))
@@ -1386,6 +1510,22 @@ Working directory: {self.directory}
         # Still auto-add any extracted files
         if extracted_files:
             self._auto_select_extracted_files(extracted_files)
+
+    def submit_agent_query(self, query: str) -> None:
+        """Programmatically submit a query to the agentic search tab.
+
+        Switches to the Agentic Search tab, inserts the query text,
+        and triggers send. Used by --agent-query CLI arg.
+        """
+        # Switch to the Agentic Search tab
+        if hasattr(self, "bottom_notebook") and hasattr(self, "agentic_search_tab"):
+            self.bottom_notebook.select(self.agentic_search_tab)
+
+        # Insert query and send
+        if hasattr(self, "chat_input"):
+            self.chat_input.delete("1.0", tk.END)
+            self.chat_input.insert("1.0", query)
+            self._send_chat_message()
 
     def _auto_select_extracted_files(self, file_paths: List[str]):
         """Add extracted files to the file selection panel."""
