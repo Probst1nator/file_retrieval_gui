@@ -1,7 +1,7 @@
 # File Retrieval GUI Dependencies
 
 # Core GUI and Interface
-tkinter; platform_system != "Darwin"
+# tkinter is part of the Python standard library - not a PyPI package.
 PyQt5>=5.15.0; platform_system != "Darwin"
 pyperclip>=1.8.0
 
