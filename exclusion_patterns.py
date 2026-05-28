@@ -38,91 +38,118 @@ def parse_pattern_string(patterns: str) -> List[str]:
     return [p.strip() for p in patterns.split(',') if p.strip()]
 
 
+def _glob_body_to_regex(glob: str) -> str:
+    """Translate the glob wildcards in a pattern body to a regex fragment.
+
+    Scans character-by-character so ``**`` is never corrupted by a later pass
+    over single ``*`` (the bug in the original implementation, where line
+    ``replace('*', '[^/]*')`` ran after ``**`` had already become ``.*`` and
+    turned it into ``.[^/]*``):
+
+    - ``**/`` -> ``(?:.*/)?``  (zero or more leading directory segments)
+    - ``**``  -> ``.*``        (anything, including ``/``)
+    - ``*``   -> ``[^/]*``     (anything except ``/`` — a single segment)
+    - ``?``   -> ``[^/]``      (a single character except ``/``)
+    - ``[...]`` -> regex character class (a leading ``[!`` becomes ``[^``)
+    - everything else is escaped as a literal
+    """
+    out: List[str] = []
+    i, n = 0, len(glob)
+    while i < n:
+        c = glob[i]
+        if c == '*':
+            if i + 1 < n and glob[i + 1] == '*':
+                i += 2
+                if i < n and glob[i] == '/':
+                    out.append('(?:.*/)?')
+                    i += 1
+                else:
+                    out.append('.*')
+            else:
+                out.append('[^/]*')
+                i += 1
+        elif c == '?':
+            out.append('[^/]')
+            i += 1
+        elif c == '[':
+            j = i + 1
+            if j < n and glob[j] in '!^':
+                j += 1
+            if j < n and glob[j] == ']':
+                j += 1
+            while j < n and glob[j] != ']':
+                j += 1
+            if j < n:  # found a closing ]
+                cls = glob[i:j + 1]
+                if cls.startswith('[!'):
+                    cls = '[^' + cls[2:]
+                out.append(cls)
+                i = j + 1
+            else:  # unmatched '[' -> literal
+                out.append('\\[')
+                i += 1
+        else:
+            out.append(re.escape(c))
+            i += 1
+    return ''.join(out)
+
+
 def glob_to_regex(pattern: str) -> str:
     """
-    Convert a single glob pattern to regex.
+    Convert a single glob pattern to a regex string (uncompiled).
 
-    Supported patterns:
-    - ** matches any number of directories (including zero)
-    - * matches anything except /
-    - ? matches any single character except /
-    - [abc] character class
-    - / separates path components
-    - Patterns ending with / are treated as directory patterns
+    Supported syntax:
+    - ``**`` matches any number of directories (including zero)
+    - ``*``  matches anything except ``/`` (a single path segment)
+    - ``?``  matches any single character except ``/``
+    - ``[abc]`` character class
+    - a trailing ``/`` marks a directory pattern (matches the directory and
+      everything inside it)
+    - a leading ``/`` roots the pattern at the start of the path
+
+    Anchoring (the result is used with ``re.search``):
+    - rooted patterns, and patterns containing ``**`` or an internal ``/``,
+      are anchored at the start (``^``)
+    - a bare literal name (``.DS_Store``) matches at any depth (``(^|/)``),
+      mirroring gitignore
+    - a bare *wildcard* name (``*.log``) matches a single segment only, so it
+      does NOT cross ``/`` — use ``**/*.log`` to match at any depth
 
     Examples:
-        "**/*.log" -> matches any .log file in any subdirectory
-        "**/node_modules/**" -> matches node_modules dir and all contents
-        ".aider*/" -> matches directories starting with .aider
-        "*.py" -> matches Python files anywhere
+        "**/*.log"            -> any .log file at any depth
+        "**/node_modules/**"  -> node_modules dir and all of its contents
+        "*.log"               -> a .log file in the top segment only
+        ".DS_Store"           -> that file at any depth
 
     Returns:
-        Regex pattern string (not compiled)
+        Regex pattern string (not compiled).
     """
-    original_pattern = pattern
-
-    # Check if it's a directory pattern (ends with /)
     is_dir = pattern.endswith('/')
-    if is_dir:
-        pattern = pattern.rstrip('/')
+    rooted = pattern.startswith('/')
 
-    # Escape special regex chars but preserve glob wildcards
-    regex_pattern = pattern
-    regex_pattern = regex_pattern.replace('\\', '\\\\')
-    regex_pattern = regex_pattern.replace('.', '\\.')
-    regex_pattern = regex_pattern.replace('+', '\\+')
-    regex_pattern = regex_pattern.replace('^', '\\^')
-    regex_pattern = regex_pattern.replace('$', '\\$')
-    regex_pattern = regex_pattern.replace('(', '\\(')
-    regex_pattern = regex_pattern.replace(')', '\\)')
-    regex_pattern = regex_pattern.replace('{', '\\{')
-    regex_pattern = regex_pattern.replace('}', '\\}')
-    regex_pattern = regex_pattern.replace('|', '\\|')
+    core = pattern[:-1] if is_dir else pattern
+    if rooted:
+        core = core[1:]
 
-    # Handle ** glob patterns
-    # **/ at the start means "zero or more directories"
-    if regex_pattern.startswith('**/'):
-        regex_pattern = '((.*/)?|^)' + regex_pattern[3:]
+    body = _glob_body_to_regex(core)
+
+    has_double = '**' in core
+    has_slash = '/' in core
+    has_wildcard = '*' in core or '?' in core
+
+    if rooted or has_double or has_slash or has_wildcard:
+        # Rooted, recursive, multi-segment, or single-segment wildcard: anchor
+        # at the start so a bare "*.log" cannot cross a "/".
+        prefix = '^'
     else:
-        # ** in the middle or end
-        regex_pattern = regex_pattern.replace('/**', '/.*')
-        regex_pattern = regex_pattern.replace('**', '.*')
+        # Bare literal name (e.g. .DS_Store, .file_copier_cache.json): match at
+        # any depth, like gitignore.
+        prefix = '(^|/)'
 
-    # Handle * (matches anything except /)
-    regex_pattern = regex_pattern.replace('*', '[^/]*')
+    # Directory patterns match the directory itself and anything beneath it.
+    suffix = '(/.*)?$' if is_dir else '$'
 
-    # Handle ? (matches any single character except /)
-    regex_pattern = regex_pattern.replace('?', '[^/]')
-
-    # Determine if pattern should match in any directory or just root
-    has_double_star = '**' in original_pattern
-    has_slash = '/' in original_pattern and not original_pattern.startswith('**/')
-
-    if original_pattern.startswith('/'):
-        # Rooted pattern - match from beginning
-        if regex_pattern.startswith('/'):
-            regex_pattern = '^' + regex_pattern[1:]
-        else:
-            regex_pattern = f'^{regex_pattern}'
-    elif not has_double_star and not has_slash:
-        # Simple pattern without ** or / - match at any depth (gitignore behavior)
-        # E.g., .DS_Store, *.log match anywhere
-        regex_pattern = f'(^|/)({regex_pattern})'
-    elif not has_double_star and has_slash:
-        # Pattern with / but no ** - match from root
-        regex_pattern = f'^{regex_pattern}'
-
-    # If it's a directory pattern, match the directory and its contents
-    if is_dir or original_pattern.endswith('/**'):
-        # Match directory itself and anything inside it
-        if not regex_pattern.endswith('.*'):
-            regex_pattern = f'{regex_pattern}(/.*)?'
-    else:
-        # For file patterns, match end of string
-        if not regex_pattern.endswith('$'):
-            regex_pattern = f'{regex_pattern}$'
-
-    return regex_pattern
+    return f'{prefix}{body}{suffix}'
 
 
 def parse_gitignore(gitignore_path: str, base_dir: str = None) -> List[str]:
