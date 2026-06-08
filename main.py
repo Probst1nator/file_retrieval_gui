@@ -8,6 +8,8 @@ import json
 if "--advertise" in sys.argv:
     metadata = [{
         "name": "File Retrieval",
+        "capability": "context-picker",
+        "category": "developing",
         "desktop_file": "file_retrieval.desktop",
         "icon": "folder-open",
         "desc": "Select and copy file contents for LLM context",
