@@ -46,7 +46,7 @@ External tool that connects to the GUI's WebSocket server to retrieve current fi
 
 Chat interface with agentic capabilities for codebase exploration:
 - **explorer_agent.py** - `ExplorerAgentLoop` orchestrates `AgenticLoop`, `ToolDiscovery`, and `LLMRouter`. Changes cwd to project dir during queries so tools resolve relative paths correctly. Truncates LLM output after first XML tool call to prevent hallucination cascades from weaker models. System prompt passed via `system=` kwarg (not as a message) to avoid being silently dropped by Gemini's message converter.
-- **LLMRouter** (`_shared/agent/llm_router.py`) - Multi-provider LLM routing with fallback chaining (Gemini -> Ollama -> Anthropic -> llama.cpp). Model selected from `.env` config.
+- **LLMRouter** (`_shared/agent/llm_router.py`) - Multi-provider LLM routing with fallback chaining (Gemini -> Ollama -> llama.cpp). Model selected from `.env` config.
 - **ToolCap filtering** - Auto-discovers XML-based tools from `_shared/agent_tools/` and `agent_tools/` filtered by `ToolCap` enum capabilities (allows `READ` + `SANDBOXED` only, blocking `WRITE`/`EXECUTE`/`NETWORK`). Common tools: `grep`, `filesystem`, `readfile`, `file_search`.
 - **AgentsNotebookTool** - Persistent scratchpad (`~/.cache/file_retrieval_gui/agents_notebook.txt`) that agents use to save file paths during exploration. Displayed in the UI Notebook Panel.
 - **File extraction** - Parses `[FILES: path1, path2]` from final agent responses to auto-select files.
