@@ -1637,7 +1637,9 @@ Working directory: {self.directory}
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
         for widget in [self.search_entry, self.exclusion_entry, self.exclude_dirs_entry, self.exclude_patterns_entry, self.preview_text, self.apply_changes_text]:
             self._bind_select_all(widget)
-            
+        self._setup_context_menus()
+
+
     def _log_message(self, message: str, level: str = 'info'):
         def update_log():
             if self.root.winfo_exists():
@@ -2160,6 +2162,96 @@ Working directory: {self.directory}
             return "break"
         w.bind("<Control-a>", sa)
         w.bind("<Command-a>", sa)
+
+    def _setup_context_menus(self):
+        """Right-click edit menu (Cut/Copy/Paste/Delete/Select All) on every text widget.
+
+        Bound per widget *class* so dynamically created widgets (chat bubbles, diff
+        tabs, tool output) get it for free without any per-widget wiring.
+        """
+        self._context_menu = tk.Menu(
+            self.root, tearoff=0,
+            bg=DARK_ENTRY_BG, fg=DARK_FG,
+            activebackground=DARK_SELECT_BG, activeforeground=DARK_FG,
+            borderwidth=0,
+        )
+        menu = self._context_menu
+        menu.add_command(label="Cut", command=lambda: self._context_menu_action("<<Cut>>"))
+        menu.add_command(label="Copy", command=lambda: self._context_menu_action("<<Copy>>"))
+        menu.add_command(label="Paste", command=lambda: self._context_menu_action("<<Paste>>"))
+        menu.add_command(label="Delete", command=lambda: self._context_menu_action("<<Clear>>"))
+        menu.add_separator()
+        menu.add_command(label="Select All", command=lambda: self._context_menu_action("select_all"))
+
+        for cls in ("Entry", "TEntry", "Text", "TCombobox", "Spinbox"):
+            self.root.bind_class(cls, "<Button-3>", self._show_context_menu, add="+")
+
+    @staticmethod
+    def _widget_is_editable(w: tk.Widget) -> bool:
+        try:
+            if isinstance(w, ttk.Entry) or isinstance(w, ttk.Combobox):
+                state = w.state()
+                return 'disabled' not in state and 'readonly' not in state
+            return str(w.cget('state')) == 'normal'
+        except tk.TclError:
+            return False
+
+    @staticmethod
+    def _widget_has_selection(w: tk.Widget) -> bool:
+        try:
+            if isinstance(w, tk.Text):
+                return bool(w.tag_ranges('sel'))
+            return bool(w.selection_present())
+        except (tk.TclError, AttributeError):
+            return False
+
+    def _select_all_in(self, w: tk.Widget):
+        try:
+            if isinstance(w, tk.Text):
+                w.tag_add('sel', '1.0', 'end-1c')
+                w.mark_set(tk.INSERT, '1.0')
+            else:
+                w.select_range(0, 'end')
+                w.icursor('end')
+        except (tk.TclError, AttributeError):
+            pass
+
+    def _context_menu_action(self, action: str):
+        w = getattr(self, '_context_menu_widget', None)
+        if w is None:
+            return
+        if action == "select_all":
+            self._select_all_in(w)
+        else:
+            w.event_generate(action)
+
+    def _show_context_menu(self, event):
+        w = event.widget
+        self._context_menu_widget = w
+        try:
+            w.focus_set()
+        except tk.TclError:
+            pass
+
+        editable = self._widget_is_editable(w)
+        has_sel = self._widget_has_selection(w)
+        try:
+            self.root.clipboard_get()
+            has_clip = True
+        except tk.TclError:
+            has_clip = False
+
+        menu = self._context_menu
+        menu.entryconfig("Cut", state=tk.NORMAL if (editable and has_sel) else tk.DISABLED)
+        menu.entryconfig("Copy", state=tk.NORMAL if has_sel else tk.DISABLED)
+        menu.entryconfig("Paste", state=tk.NORMAL if (editable and has_clip) else tk.DISABLED)
+        menu.entryconfig("Delete", state=tk.NORMAL if (editable and has_sel) else tk.DISABLED)
+
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+        return "break"
 
     def _setup_interrupt_handler(self):
         self.interrupted = False
