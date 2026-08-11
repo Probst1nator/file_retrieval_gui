@@ -69,7 +69,22 @@ file contents
 ```
 ```
 
-**Apply changes input formats** (supports multiple formats, tried in priority order):
+**Apply changes input formats.** `preview_changes_to_files` consumes `<patch>` blocks
+first, then the three markdown forms in order. A path claimed by a `<patch>` block is
+never re-matched by a markdown pattern.
+
+0. `<patch>` — surgical search/replace, or a full overwrite:
+```markdown
+<patch file="path/to/file.ext">
+<search>
+exact text to find
+</search>
+<replace>
+text to put there
+</replace>
+</patch>
+```
+A block with no `<search>` is a full overwrite (body, or a lone `<replace>` block).
 
 1. **File:** annotation (most explicit):
 ```markdown
@@ -97,6 +112,29 @@ new file content
 ```
 
 **Notes:**
-- File extension required in all formats
-- Duplicate detection prevents applying same code block multiple times
-- Absolute paths and paths with `..` are rejected for security
+- File extension required in all markdown formats (the `<patch>` `file=` attribute is
+  taken as given).
+- **The opening fence must follow the path marker immediately** — only blank lines may
+  intervene. The patterns are compiled with `re.DOTALL` for the content group, so before
+  this was enforced a heading merely *mentioning* a filename captured the next unrelated
+  code block paragraphs later.
+- **Several `<patch>` blocks naming the same file chain onto each other** — block 2 is
+  applied to block 1's result and they collapse into one `FileChange` with one combined
+  diff. If any block's `<search>` fails to match, the whole file is marked invalid and
+  nothing is written for it (all-or-nothing, per `apply_text_patch`).
+- The markdown patterns dedup by path: the *first* block for a path wins, later ones are
+  dropped.
+- Absolute paths and paths with `..` are rejected for security.
+- Changes that fail to parse become `ChangeType.INVALID_PATH`, carry the reason in
+  `error_message`, and are created **unselected**. `status_summary` surfaces that reason
+  (collapsed to one line for the tree; the full text is in the change's preview tab), and
+  `apply_selected_changes` reports a selected-but-invalid change as an error rather than
+  skipping it silently.
+
+**Undo/redo.** Both apply paths record an `ApplyOperation` in `ApplyHistoryManager`,
+which is keyed **by project root**. `apply_selected_with_history(changes, root_directory)`
+therefore takes the root explicitly — it must be the same string the GUI later passes to
+`can_undo()`/`can_redo()` (`self.directory`), or the operation is filed under a key
+nobody queries and Undo silently stays disabled.
+
+Tests for all of the above: `test_apply_changes.py`.

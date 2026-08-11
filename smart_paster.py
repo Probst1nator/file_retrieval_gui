@@ -83,9 +83,13 @@ class FileChange:
     def __post_init__(self):
         """Generate diff lines after initialization."""
         if self.change_type == ChangeType.MODIFY_FILE and self.original_content is not None:
+            # splitlines() without keepends, so no diff line carries a trailing
+            # newline -- the renderer appends its own. Mixing keepends=True with
+            # lineterm="" double-spaced the body lines while leaving the
+            # ---/+++/@@ headers single-spaced.
             self.diff_lines = list(difflib.unified_diff(
-                self.original_content.splitlines(keepends=True),
-                self.content.splitlines(keepends=True),
+                self.original_content.splitlines(),
+                self.content.splitlines(),
                 fromfile=f"a/{self.file_path}",
                 tofile=f"b/{self.file_path}",
                 lineterm=""
@@ -113,7 +117,9 @@ class FileChange:
         elif self.change_type == ChangeType.MODIFY_FILE:
             return f"+{self.lines_added} -{self.lines_removed} lines"
         else:
-            return "Invalid path"
+            # One line: this is rendered in a Treeview cell. The untruncated
+            # message is shown in the change's own preview tab.
+            return " ".join((self.error_message or "Invalid path").split())
 
 # --- History Management for Undo/Redo ---
 
@@ -833,21 +839,32 @@ def preview_changes_to_files(content_to_apply: str, root_directory: str) -> List
     Parses the content and generates a preview of all file changes without applying them.
     Returns a list of FileChange objects representing each file modification.
 
-    Supports multiple formats (tried in priority order):
-    1. **File:** annotation - e.g., "**File:** `path/to/file.ext`"
-    2. Heading immediately followed by code block - e.g., "# path/to/file.ext"
-    3. Code block with # path inside - e.g., "```\n# path/to/file.ext\n..."
-    4. PATCH format - e.g., "# PATCH path/to/file.ext" with search/replace blocks
+    Supports multiple formats (the <patch> form is consumed first, then the
+    markdown forms in list order):
+    1. <patch file="path/to/file.ext"> with <search>/<replace> blocks, or with
+       a bare body / <replace> block for a full overwrite. Several <patch>
+       blocks naming the same file chain onto each other.
+    2. **File:** annotation - e.g., "**File:** `path/to/file.ext`"
+    3. Heading immediately followed by code block - e.g., "# path/to/file.ext"
+    4. Code block with # path inside - e.g., "```\n# path/to/file.ext\n..."
+
+    In every markdown form the opening fence must follow the path marker
+    immediately (only blank lines may intervene).
     """
     changes: List[FileChange] = []
 
     # --- 1. EXISTING PATTERNS (For Full Overwrites) ---
+    # The parts before the opening fence use [^\n]* rather than .*?, so that
+    # re.DOTALL (needed for the content group) cannot let the marker and the
+    # fence sit paragraphs apart. Only whitespace/blank lines may separate them
+    # -- otherwise prose merely *mentioning* a filename captured the next
+    # unrelated code block as if it were that file's new contents.
     patterns = [
         # **File:** annotation
-        (r'\*\*File:\*\*\s*`?([^\s`\n]+\.[a-zA-Z0-9]+)`?.*?\n```(?:[a-zA-Z0-9]*)?\n(.*?)\n```',
+        (r'\*\*File:\*\*\s*`?([^\s`\n]+\.[a-zA-Z0-9]+)`?[^\n]*\n\s*```(?:[a-zA-Z0-9]*)?\n(.*?)\n```',
          "file_annotation", 2),
         # Standard Heading # filename
-        (r"^#+\s*(?:\d+\.\s*)?.*?(?:`([^`]+\.[a-zA-Z0-9]+)`|([^\s`]+\.[a-zA-Z0-9]+)).*?\n```(?:[a-zA-Z0-9]*)?\n(.*?)\n```",
+        (r"^#+[^\n]*?(?:`([^`]+\.[a-zA-Z0-9]+)`|([^\s`]+\.[a-zA-Z0-9]+))[^\n]*\n\s*```(?:[a-zA-Z0-9]*)?\n(.*?)\n```",
          "heading_format", 3),
         # Inline code block path
         (r"^```(?:[a-zA-Z0-9]*)?\n\s*#\s*(?:`([^`]+\.[a-zA-Z0-9]+)`|([^\s`]+\.[a-zA-Z0-9]+))\n(.*?)\n```",
@@ -863,6 +880,12 @@ def preview_changes_to_files(content_to_apply: str, root_directory: str) -> List
 
     matched_files = set()
 
+    # <patch> results accumulate per file. Several surgical patches to the same
+    # file must chain onto each other -- computing each one against the same
+    # on-disk original produced N FileChanges that each held only their own edit,
+    # so applying them wrote them in order and every edit but the last was lost.
+    patched: Dict[str, FileChange] = {}
+
     # --- PROCESS PATCHES FIRST ---
     for match in patch_pattern.finditer(content_to_apply):
         file_path = match.group(1).strip()
@@ -871,57 +894,72 @@ def preview_changes_to_files(content_to_apply: str, root_directory: str) -> List
         if not file_path: continue
         matched_files.add(file_path)  # Mark as processed so overwrite patterns don't grab it
 
-        full_path = os.path.join(root_directory, file_path.replace('/', os.path.sep))
-        
         # Security Check
         if ".." in file_path or os.path.isabs(file_path):
-            changes.append(FileChange(
+            patched[file_path] = FileChange(
                 file_path=file_path, content="", change_type=ChangeType.INVALID_PATH,
-                full_path="", error_message="Unsafe path"
-            ))
+                full_path="", error_message="Unsafe path", selected=False
+            )
+            continue
+
+        full_path = os.path.join(root_directory, file_path.replace('/', os.path.sep))
+        pending = patched.get(file_path)
+
+        # An earlier block for this file already failed -- keep that first error
+        # rather than layering a second, more confusing one on top of it.
+        if pending is not None and pending.change_type == ChangeType.INVALID_PATH:
             continue
 
         # Check if it's a surgical patch (has <search>) or full overwrite
         is_surgical = "<search>" in raw_patch_content.lower()
 
         if is_surgical:
-            if not os.path.exists(full_path):
-                changes.append(FileChange(
+            if pending is None and not os.path.exists(full_path):
+                patched[file_path] = FileChange(
                     file_path=file_path, content="", change_type=ChangeType.INVALID_PATH,
-                    full_path=full_path, error_message="Cannot patch: File does not exist"
-                ))
+                    full_path=full_path, error_message="Cannot patch: File does not exist",
+                    selected=False
+                )
                 continue
 
             try:
-                with open(full_path, 'r', encoding='utf-8') as f:
-                    original_content = f.read()
+                if pending is not None:
+                    # Chain onto the previous block's result, not the disk.
+                    base_content = pending.content
+                    original_content = pending.original_content
+                else:
+                    with open(full_path, 'r', encoding='utf-8') as f:
+                        base_content = f.read()
+                    original_content = base_content
 
                 # Apply the patch logic
-                new_content, success, msg = apply_text_patch(original_content, raw_patch_content)
+                new_content, success, msg = apply_text_patch(base_content, raw_patch_content)
 
                 if success:
-                    changes.append(FileChange(
+                    patched[file_path] = FileChange(
                         file_path=file_path,
                         content=new_content,
-                        change_type=ChangeType.MODIFY_FILE,
+                        change_type=pending.change_type if pending is not None else ChangeType.MODIFY_FILE,
                         full_path=full_path,
                         original_content=original_content
-                    ))
+                    )
                 else:
-                    changes.append(FileChange(
+                    patched[file_path] = FileChange(
                         file_path=file_path,
-                        content=original_content,
+                        content=original_content or "",
                         change_type=ChangeType.INVALID_PATH,
                         full_path=full_path,
-                        error_message=f"Patch Failed: {msg}"
-                    ))
+                        error_message=f"Patch Failed: {msg}",
+                        selected=False
+                    )
             except Exception as e:
-                changes.append(FileChange(
+                patched[file_path] = FileChange(
                     file_path=file_path, content="", change_type=ChangeType.INVALID_PATH,
-                    full_path=full_path, error_message=f"Error reading file: {e}"
-                ))
+                    full_path=full_path, error_message=f"Error reading file: {e}",
+                    selected=False
+                )
         else:
-            # Full overwrite logic for <patch> block
+            # Full overwrite logic for <patch> block -- replaces anything pending.
             # Extract content inside <replace> if it exists, otherwise use raw text
             replace_match = re.search(r'<replace>\n?(.*?)\n?</replace>', raw_patch_content, re.DOTALL | re.IGNORECASE)
             if replace_match:
@@ -929,29 +967,33 @@ def preview_changes_to_files(content_to_apply: str, root_directory: str) -> List
             else:
                 new_content = raw_patch_content.strip()
 
-            if os.path.exists(full_path):
+            if pending is not None:
+                original_content = pending.original_content
+                change_type = pending.change_type
+            elif os.path.exists(full_path):
                 try:
                     with open(full_path, 'r', encoding='utf-8') as f:
                         original_content = f.read()
-                    changes.append(FileChange(
-                        file_path=file_path,
-                        content=new_content + '\n',
-                        change_type=ChangeType.MODIFY_FILE,
-                        full_path=full_path,
-                        original_content=original_content
-                    ))
                 except Exception as e:
-                    changes.append(FileChange(
+                    patched[file_path] = FileChange(
                         file_path=file_path, content="", change_type=ChangeType.INVALID_PATH,
-                        full_path=full_path, error_message=str(e)
-                    ))
+                        full_path=full_path, error_message=str(e), selected=False
+                    )
+                    continue
+                change_type = ChangeType.MODIFY_FILE
             else:
-                changes.append(FileChange(
-                    file_path=file_path,
-                    content=new_content + '\n',
-                    change_type=ChangeType.NEW_FILE,
-                    full_path=full_path
-                ))
+                original_content = None
+                change_type = ChangeType.NEW_FILE
+
+            patched[file_path] = FileChange(
+                file_path=file_path,
+                content=new_content + '\n',
+                change_type=change_type,
+                full_path=full_path,
+                original_content=original_content
+            )
+
+    changes.extend(patched.values())
 
     # --- PROCESS OVERWRITES (Existing Logic) ---
     for pattern_regex, _, content_group_idx in patterns:
@@ -976,7 +1018,7 @@ def preview_changes_to_files(content_to_apply: str, root_directory: str) -> List
             if ".." in file_path or os.path.isabs(file_path):
                 changes.append(FileChange(
                     file_path=file_path, content="", change_type=ChangeType.INVALID_PATH,
-                    full_path="", error_message="Unsafe path"
+                    full_path="", error_message="Unsafe path", selected=False
                 ))
                 continue
 
@@ -997,7 +1039,7 @@ def preview_changes_to_files(content_to_apply: str, root_directory: str) -> List
                 except Exception as e:
                      changes.append(FileChange(
                         file_path=file_path, content="", change_type=ChangeType.INVALID_PATH,
-                        full_path=full_path, error_message=str(e)
+                        full_path=full_path, error_message=str(e), selected=False
                     ))
             else:
                 changes.append(FileChange(
@@ -1017,9 +1059,18 @@ def apply_selected_changes(changes: List[FileChange]) -> Dict[str, List[str]]:
     results: Dict[str, List[str]] = {"success": [], "errors": []}
     
     for change in changes:
-        if not change.selected or change.change_type == ChangeType.INVALID_PATH:
+        if not change.selected:
             continue
-            
+
+        # Report, rather than silently skip, a change the user asked to apply
+        # but that never parsed cleanly -- otherwise a run in which every patch
+        # failed reported "0 success, 0 errors" and the reason was discarded.
+        if change.change_type == ChangeType.INVALID_PATH:
+            results["errors"].append(
+                f"Skipped {change.file_path}: {change.error_message or 'invalid path'}"
+            )
+            continue
+
         try:
             # Ensure directory exists
             os.makedirs(os.path.dirname(change.full_path), exist_ok=True)
@@ -1040,12 +1091,13 @@ def apply_changes_to_files(content_to_apply: str, root_directory: str) -> Dict[s
     then writing them. This ensures exact consistency between previewing and applying.
     """
     changes = preview_changes_to_files(content_to_apply, root_directory)
-    
-    # Select all valid changes for application
+
+    # Select every change: apply_selected_changes writes the valid ones and
+    # reports the invalid ones as errors, so a failed patch surfaces here too
+    # (this path has no preview dialog to show it in).
     for change in changes:
-        if change.change_type != ChangeType.INVALID_PATH:
-            change.selected = True
-            
+        change.selected = True
+
     results = apply_selected_changes(changes)
     
     # Calculate total chars for backward compatibility with existing return dict
@@ -1109,23 +1161,24 @@ def apply_changes_with_history(
     return results, operation
 
 def apply_selected_with_history(
-    changes: List[FileChange]
+    changes: List[FileChange],
+    root_directory: str
 ) -> Tuple[Dict[str, List[str]], Optional[ApplyOperation]]:
     """
     Apply selected changes and return both results and an ApplyOperation for history.
     Returns (results_dict, operation_or_none)
+
+    `root_directory` is the project root the changes were parsed against; it is
+    the key ApplyHistoryManager files the operation under, so it must match the
+    directory the GUI later passes to can_undo()/can_redo().
     """
     # Capture BEFORE snapshots for selected files
     before_snapshots = {}
-    root_directory = None
 
     for change in changes:
         if change.selected and change.change_type != ChangeType.INVALID_PATH:
             snapshot = FileSnapshot.capture(change.full_path, change.file_path)
             before_snapshots[change.file_path] = snapshot
-            # Get root directory from the full path
-            if root_directory is None:
-                root_directory = os.path.dirname(change.full_path).split(change.file_path.replace('/', os.path.sep))[0].rstrip(os.path.sep)
 
     # Apply the changes
     results = apply_selected_changes(changes)

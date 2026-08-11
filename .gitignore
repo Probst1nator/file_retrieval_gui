@@ -85,11 +85,10 @@ audio_temp/
 websocket_logs/
 server_cache/
 
-# Test files
+# Test fixtures (the tests themselves are tracked -- the repo-wide pre-push
+# hook runs pytest, so ignoring test_*.py kept this tool out of the suite)
 test_files/
 sample_data/
-test_*.py
-*_test.py
 
 # Documentation temp files
 docs_temp/

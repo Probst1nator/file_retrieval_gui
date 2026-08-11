@@ -1714,7 +1714,7 @@ Working directory: {self.directory}
 
     def _apply_selected_changes_worker(self, changes: List[FileChange]):
         """Apply the selected changes in a worker thread."""
-        results, operation = apply_selected_with_history(changes)
+        results, operation = apply_selected_with_history(changes, self.directory)
 
         # Add to history if operation was created
         if operation:
@@ -1728,6 +1728,11 @@ Working directory: {self.directory}
         summary = f"Apply Selected Changes: Finished. {len(results['success'])} success, {len(results['errors'])} errors."
         self._log_message(summary, 'error' if results['errors'] else 'success')
         if results['success']:
+            # Same visible confirmation the direct "Apply to Files" path gives.
+            total_chars = sum(len(c.content) for c in changes if c.file_path in results['success'])
+            status_text = f"Applied! Written: {len(results['success'])} files | {total_chars} chars"
+            self.root.after(0, lambda: self.apply_status_label.config(text=status_text))
+            self.root.after(5000, lambda: self.apply_status_label.config(text=""))
             self.root.after(0, self._perform_filter)
 
     def _update_history_buttons(self):
@@ -2751,22 +2756,30 @@ class PreviewChangesDialog:
         self.dialog.geometry("1200x800")
         self.dialog.configure(bg=DARK_BG)
         self.dialog.transient(parent)
-        self.dialog.grab_set()
-        
+
         # Center the dialog
         self.dialog.update_idletasks()
         x = (self.dialog.winfo_screenwidth() // 2) - (1200 // 2)
         y = (self.dialog.winfo_screenheight() // 2) - (800 // 2)
         self.dialog.geometry(f"1200x800+{x}+{y}")
-        
-        self._setup_styles()
-        self._create_widgets()
-        self._populate_data()
-        
+
+        # Build before grabbing. A failure while constructing widgets used to
+        # leave a grabbed, half-built Toplevel alive -- the caller logged the
+        # exception and the main window stayed frozen with no way back.
+        try:
+            self._setup_styles()
+            self._create_widgets()
+            self._populate_data()
+        except Exception:
+            self.dialog.destroy()
+            raise
+
         # Handle window close
         self.dialog.protocol("WM_DELETE_WINDOW", self._on_cancel)
-        
+        self.dialog.bind("<Escape>", lambda e: self._on_cancel())
+
         # Wait for dialog to close
+        self.dialog.grab_set()
         self.dialog.wait_window()
     
     def _setup_styles(self):
@@ -2837,13 +2850,17 @@ class PreviewChangesDialog:
         self.files_tree.heading("type", text="Type", anchor='w')
         self.files_tree.heading("changes", text="Changes", anchor='w')
         
-        self.files_tree.column("#0", width=400, stretch=tk.YES)
-        self.files_tree.column("status", width=150, stretch=tk.NO)
-        self.files_tree.column("type", width=100, stretch=tk.NO)
-        self.files_tree.column("changes", width=150, stretch=tk.NO)
-        
-        # Add checkboxes functionality
+        self.files_tree.column("#0", width=380, stretch=tk.YES)
+        self.files_tree.column("status", width=120, stretch=tk.NO)
+        self.files_tree.column("type", width=90, stretch=tk.NO)
+        # Wide: for invalid changes this column carries the failure reason.
+        self.files_tree.column("changes", width=380, stretch=tk.NO)
+
+        # Add checkboxes functionality. Only clicks in the path column toggle;
+        # a double-click is swallowed so it cannot toggle twice.
         self.files_tree.bind("<Button-1>", self._on_tree_click)
+        self.files_tree.bind("<Double-1>", lambda e: "break")
+        self.files_tree.bind("<space>", self._on_tree_space)
         
         # Scrollbar for tree
         tree_scrollbar = ttk.Scrollbar(tree_frame, orient='vertical', command=self.files_tree.yview)
@@ -2861,16 +2878,28 @@ class PreviewChangesDialog:
         ttk.Button(controls_frame, text="Select None", command=self._select_none,
                   style="Preview.TButton").pack(side=tk.LEFT, padx=(5, 0))
         
+    @staticmethod
+    def _tab_label(file_path: str, limit: int = 28) -> str:
+        """Elide a relative path from the left, keeping the distinguishing tail.
+
+        A bare basename made src/main.py and tests/main.py two identical tabs.
+        """
+        if len(file_path) <= limit:
+            return file_path
+        return "..." + file_path[-(limit - 3):]
+
     def _create_file_tabs(self):
-        """Create individual tabs for each file with diff view."""
+        """Create individual tabs for each file change.
+
+        Invalid changes get a tab too -- their error_message is the only place
+        the parse failure is explained, and giving every change a tab keeps tab
+        order aligned with the overview tree.
+        """
         for i, change in enumerate(self.changes):
-            if change.change_type == ChangeType.INVALID_PATH:
-                continue
-                
             tab_frame = ttk.Frame(self.notebook, style="Preview.TFrame", padding=10)
-            tab_name = os.path.basename(change.file_path)
-            if len(tab_name) > 20:
-                tab_name = tab_name[:17] + "..."
+            tab_name = self._tab_label(change.file_path)
+            if change.change_type == ChangeType.INVALID_PATH:
+                tab_name = "! " + tab_name
             self.notebook.add(tab_frame, text=tab_name)
             
             # File info header
@@ -2894,9 +2923,10 @@ class PreviewChangesDialog:
             
             # Configure diff highlighting
             diff_text.tag_config("added", foreground="#22C55E", background="#0F2A1A")
-            diff_text.tag_config("removed", foreground="#F87171", background="#2A0F0F") 
+            diff_text.tag_config("removed", foreground="#F87171", background="#2A0F0F")
             diff_text.tag_config("context", foreground="#9CA3AF")
             diff_text.tag_config("header", foreground="#60A5FA", font=("Consolas", 10, "bold"))
+            diff_text.tag_config("error", foreground="#F87171", font=("Consolas", 10, "bold"))
             
             # Enable Ctrl+A to select all
             diff_text.bind("<Control-a>", lambda e, w=diff_text: (w.tag_add(tk.SEL, "1.0", tk.END), w.mark_set(tk.INSERT, "1.0"), w.see(tk.INSERT), "break")[-1])
@@ -2906,7 +2936,10 @@ class PreviewChangesDialog:
     
     def _populate_diff_content(self, text_widget: scrolledtext.ScrolledText, change: FileChange):
         """Populate the diff content for a file change."""
-        if change.change_type == ChangeType.NEW_FILE:
+        if change.change_type == ChangeType.INVALID_PATH:
+            text_widget.insert(tk.END, "This change cannot be applied.\n\n", "error")
+            text_widget.insert(tk.END, change.error_message or "Invalid path", "removed")
+        elif change.change_type == ChangeType.NEW_FILE:
             text_widget.insert(tk.END, f"New file: {change.file_path}\n", "header")
             text_widget.insert(tk.END, f"+++ {change.file_path}\n", "header")
             for line_num, line in enumerate(change.content.splitlines(), 1):
@@ -2944,38 +2977,54 @@ class PreviewChangesDialog:
                 status = "📝 Modified"
                 type_text = "Modified"
             
-            item_id = self.files_tree.insert("", tk.END, 
-                                           text=f"{checkbox_text} {change.file_path}",
-                                           values=(status, type_text, change.status_summary),
-                                           tags=(f"change_{i}",))
+            self.files_tree.insert("", tk.END,
+                                   text=f"{checkbox_text} {change.file_path}",
+                                   values=(status, type_text, change.status_summary),
+                                   tags=(f"change_{i}",))
     
+    def _toggle_item(self, item):
+        """Flip the checkbox of one tree row, if it is togglable."""
+        tags = self.files_tree.item(item, 'tags')
+        if not tags:
+            return
+        change = self.changes[int(tags[0].split('_')[1])]
+        if change.change_type == ChangeType.INVALID_PATH:
+            return
+        change.selected = not change.selected
+        checkbox_text = "☑" if change.selected else "☐"
+        self.files_tree.item(item, text=f"{checkbox_text} {change.file_path}")
+
     def _on_tree_click(self, event):
-        """Handle clicking on tree items to toggle selection."""
-        item = self.files_tree.identify('item', event.x, event.y)
+        """Toggle selection, but only for clicks on the checkbox/path column.
+
+        This used to fire anywhere in the row, so merely clicking a row to read
+        its Status or Changes column silently flipped its checkbox.
+        """
+        if self.files_tree.identify_region(event.x, event.y) != "tree":
+            return
+        item = self.files_tree.identify_row(event.y)
         if item:
-            tags = self.files_tree.item(item, 'tags')
-            if tags:
-                change_idx = int(tags[0].split('_')[1])
-                change = self.changes[change_idx]
-                
-                if change.change_type != ChangeType.INVALID_PATH:
-                    change.selected = not change.selected
-                    checkbox_text = "☑" if change.selected else "☐"
-                    current_text = self.files_tree.item(item, 'text')
-                    new_text = f"{checkbox_text} {change.file_path}"
-                    self.files_tree.item(item, text=new_text)
-    
+            self._toggle_item(item)
+
+    def _on_tree_space(self, event):
+        """Space toggles the focused row (keyboard equivalent of a click)."""
+        item = self.files_tree.focus()
+        if item:
+            self._toggle_item(item)
+        return "break"
+
     def _select_all(self):
         """Select all valid changes."""
-        for i, change in enumerate(self.changes):
+        for change in self.changes:
             if change.change_type != ChangeType.INVALID_PATH:
                 change.selected = True
         self._refresh_tree()
-    
+
     def _select_none(self):
-        """Deselect all changes."""
+        """Deselect all valid changes (invalid ones are never selectable)."""
         for change in self.changes:
-            change.selected = False
+            if change.change_type != ChangeType.INVALID_PATH:
+                change.selected = False
         self._refresh_tree()
     
     def _refresh_tree(self):
