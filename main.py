@@ -38,7 +38,10 @@ from gui import FileCopierApp
 from smart_paster import build_clipboard_content, process_smart_request
 
 try:
-    from _shared.tool_installer import ToolInstaller, ToolMetadata
+    try:
+        from cli_tool_kit import ToolInstaller, ToolMetadata
+    except ImportError:
+        from _shared.tool_installer import ToolInstaller, ToolMetadata
 except ImportError:
     try:
         from _vendor.tool_installer import ToolInstaller, ToolMetadata
