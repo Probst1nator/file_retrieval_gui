@@ -14,7 +14,7 @@ try:
 except ImportError:
     import sys
     from pathlib import Path as _Path
-    sys.path.insert(0, str(_Path(__file__).parent.parent.parent.parent))
+    sys.path.insert(0, str(_Path(__file__).parent.parent.parent))
     from _shared.agent import BaseTool, ToolCap
 
 

@@ -19,10 +19,19 @@ try:
 except ImportError:
     import sys
     # Add parent of tools dir to path assuming tools is the repo root
-    sys.path.insert(0, str(Path(__file__).parent.parent.parent))
-    from _shared.agent.tool_discovery import ToolDiscovery
-    from _shared.agent.xml_tools import AgenticLoop, ToolCap
-    from _shared.agent.llm_router import LLMRouter
+    sys.path.insert(0, str(Path(__file__).parent.parent))
+    try:
+        from _shared.agent.tool_discovery import ToolDiscovery
+        from _shared.agent.xml_tools import AgenticLoop, ToolCap
+        from _shared.agent.llm_router import LLMRouter
+    except ModuleNotFoundError as exc:
+        if not (exc.name or "").startswith("_shared"):
+            raise  # a dependency of _shared is missing, not _shared itself
+        # Standalone copy: the agent needs _shared from the tools monorepo.
+        raise ImportError(
+            "The agentic search needs the tools monorepo (_shared/agent).",
+            name="_shared",
+        ) from exc
 
 try:
     from agent_tools.notebook import AgentsNotebookTool
@@ -62,7 +71,7 @@ class ExplorerAgentLoop:
         
         # Discover tools
         discovery_paths = [
-            str(Path(__file__).parent.parent.parent / "_shared" / "agent_tools"),
+            str(Path(__file__).parent.parent / "_shared" / "agent_tools"),
             str(Path(__file__).parent / "agent_tools")
         ]
         

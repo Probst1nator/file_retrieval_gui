@@ -803,6 +803,17 @@ class FileCopierApp:
 
     def _create_agentic_search_pane(self, parent):
         """Create the Agentic Search chat interface tab."""
+        # ExplorerAgentLoop needs _shared from the tools monorepo; check before building widgets
+        try:
+            from explorer_agent import ExplorerAgentLoop
+        except ImportError as exc:
+            if exc.name == "_shared":
+                text = "Agentic search needs the tools monorepo (_shared/agent)."
+            else:
+                text = f"Agentic search could not load: {exc}"
+            ttk.Label(parent, text=text).pack(pady=10)
+            return
+
         main_container = ttk.Frame(parent)
         main_container.pack(fill=tk.BOTH, expand=True)
 
@@ -818,8 +829,6 @@ class FileCopierApp:
         # === NOTEBOOK PANEL ===
         self._create_notebook_panel(main_container)
 
-        # Initialize ExplorerAgentLoop
-        from explorer_agent import ExplorerAgentLoop
         self.explorer_agent = ExplorerAgentLoop(
             project_dir=self.directory,
             on_tool_result=self._on_tool_result,
@@ -1517,6 +1526,9 @@ Working directory: {self.directory}
         Switches to the Agentic Search tab, inserts the query text,
         and triggers send. Used by --agent-query CLI arg.
         """
+        if not hasattr(self, "explorer_agent"):
+            self._log_message("Agentic search is not available in this copy.", "error")
+            return
         # Switch to the Agentic Search tab
         if hasattr(self, "bottom_notebook") and hasattr(self, "agentic_search_tab"):
             self.bottom_notebook.select(self.agentic_search_tab)
@@ -1550,6 +1562,9 @@ Working directory: {self.directory}
         """Inject a query from external WebSocket client into the chat."""
         if not query.strip():
             return
+        if not hasattr(self, "explorer_agent"):
+            self._log_message("Agentic search is not available in this copy.", "error")
+            return
 
         # Don't inject if already generating
         if self._generation_in_progress:
@@ -1570,6 +1585,8 @@ Working directory: {self.directory}
     def _inject_external_response(self, response: str):
         """Inject a response from external WebSocket client into the chat."""
         if not response.strip():
+            return
+        if not hasattr(self, "explorer_agent"):
             return
 
         # Extract files and create message

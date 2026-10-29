@@ -127,7 +127,7 @@ def main():
     # Try agent-specific .env first, then fall back to root .env
     env_file = Path(__file__).parent / ".env"
     if not env_file.exists():
-        env_file = Path(__file__).parent.parent.parent / ".env"
+        env_file = Path(__file__).parent.parent / ".env"
 
     if env_file.exists():
         with open(env_file) as f:

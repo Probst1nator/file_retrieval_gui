@@ -29,7 +29,7 @@ import asyncio
 
 # Setup path for shared imports (root is two levels up from tool subdirectory)
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-ROOT_DIR = os.path.dirname(os.path.dirname(SCRIPT_DIR))
+ROOT_DIR = os.path.dirname(SCRIPT_DIR)
 if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
@@ -39,7 +39,7 @@ from smart_paster import build_clipboard_content, process_smart_request
 
 try:
     try:
-        from cli_tool_kit import ToolInstaller, ToolMetadata
+        from cli_tools_kit import ToolInstaller, ToolMetadata
     except ImportError:
         from _shared.tool_installer import ToolInstaller, ToolMetadata
 except ImportError:

@@ -9,7 +9,7 @@ from datetime import datetime
 
 # Add parent directories to path for shared module imports
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-TOOLS_ROOT = os.path.dirname(os.path.dirname(SCRIPT_DIR))
+TOOLS_ROOT = os.path.dirname(SCRIPT_DIR)
 if TOOLS_ROOT not in sys.path:
     sys.path.insert(0, TOOLS_ROOT)
 
